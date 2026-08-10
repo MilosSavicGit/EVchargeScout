@@ -56,9 +56,11 @@
   .sub{color:var(--muted);font-style:italic;font-size:12px;margin-bottom:12px}
   .field{margin:8px 0}
   .field label{display:block;font-size:12px;color:var(--muted);margin-bottom:3px;letter-spacing:.02em}
-  .field input{width:100%;border:1px solid var(--rule);border-radius:10px;padding:10px 12px;font-size:14px;background:#fff;color:var(--ink)}
+  /* 16px, always: iOS Safari auto-zooms into any focused control under 16px and does NOT
+     zoom back out — that stuck zoom was the "window too big" on iPhone. Keep every control ≥16px. */
+  .field input{width:100%;border:1px solid var(--rule);border-radius:10px;padding:10px 12px;font-size:16px;background:#fff;color:var(--ink)}
   .field input:focus{outline:none;border-color:var(--accent)}
-  .carsel{width:100%;border:1px solid var(--rule);border-radius:10px;padding:10px 12px;font-size:14px;background:#fff;color:var(--ink);font-family:inherit}
+  .carsel{width:100%;border:1px solid var(--rule);border-radius:10px;padding:10px 12px;font-size:16px;background:#fff;color:var(--ink);font-family:inherit}
   .carsel:focus{outline:none;border-color:var(--accent)}
   .wprow{display:flex;gap:6px;align-items:center}
   .wprow input{flex:1}
@@ -124,6 +126,23 @@
   .foot{font-size:11px;color:var(--muted);line-height:1.5;margin-top:16px;border-top:1px solid var(--rule);padding-top:12px}
   .foot a{color:var(--accent2)}
   .busy{font-size:12px;color:var(--muted);min-height:16px;margin-top:6px}
+
+  /* accommodation overlay — opens as its own full-screen "window" over the map */
+  .stay-page{position:fixed;inset:0;z-index:60;background:var(--paper);overflow-y:auto;display:none}
+  .stay-page.show{display:block}
+  .stay-header{position:sticky;top:0;background:var(--panel);border-bottom:1px solid var(--rule);
+    display:flex;align-items:center;gap:12px;padding:12px 14px;z-index:2}
+  .stay-back{appearance:none;border:1px solid var(--rule);background:#fff;color:var(--ink);
+    border-radius:999px;padding:9px 15px;font-family:inherit;font-size:15px;font-weight:bold;cursor:pointer;white-space:nowrap}
+  .stay-back:hover{border-color:var(--accent);color:var(--accent)}
+  .stay-title{font-size:15px;font-weight:bold;overflow-wrap:anywhere;line-height:1.3}
+  .stay-status{padding:12px 16px;color:var(--muted);font-size:13px;line-height:1.5}
+  .stay-list{max-width:640px;margin:0 auto;padding:0 14px 28px}
+  .stay-result{background:#fff;border:1px solid var(--rule);border-radius:14px;padding:13px;margin:10px 0}
+  .stay-result h3{margin:0 0 4px;font-size:15px;overflow-wrap:anywhere}
+  .stay-result .t{color:var(--muted);font-size:12.5px;line-height:1.5;overflow-wrap:anywhere}
+  .stay-dir{display:inline-block;margin-top:9px;font-size:14px;font-weight:bold;color:var(--accent2);text-decoration:none}
+  .stay-dir:hover{text-decoration:underline}
 </style>
 </head>
 <body>
@@ -185,6 +204,16 @@
     <div id="summary"></div>
   </div>
   <div id="map"></div>
+</div>
+
+<!-- ============ ACCOMMODATION (Stay Nearby) OVERLAY ============ -->
+<div id="stayPage" class="stay-page">
+  <div class="stay-header">
+    <button class="stay-back" id="stayBack">← Back to map</button>
+    <div class="stay-title" id="stayTitle">Accommodation nearby</div>
+  </div>
+  <div class="stay-status" id="stayStatus"></div>
+  <div id="stayList" class="stay-list"></div>
 </div>
 
 <script>
@@ -591,7 +620,11 @@ function addStopField(value){
 }
 $('addStop').addEventListener('click', () => addStopField(''));
 
-/* ---------------- place-search autocomplete (Nominatim) ---------------- */
+/* ---------------- place-search autocomplete ----------------
+   Photon (photon.komoot.io) is built for type-ahead: it returns good matches from the first
+   few letters and takes a lat/lon bias, so nearby places come first. That fixes both problems
+   the old Nominatim-only box had — you had to type the (almost) full name, and results were
+   biased to the US. Nominatim is kept as a fallback if Photon is unreachable. */
 let userLoc = null, geoAsked = false;
 function askGeo(){                                    // once, when a search box is focused
   if (geoAsked || !navigator.geolocation) return;
@@ -600,8 +633,51 @@ function askGeo(){                                    // once, when a search box
     p => { userLoc = { lat:p.coords.latitude, lon:p.coords.longitude }; },
     () => {}, { timeout:8000, maximumAge:600000 });
 }
+// One normalized shape for suggestions: { label, name, lat, lon, cc }.
+function photonLabel(pr){
+  const parts = [pr.name,
+    pr.city && pr.city !== pr.name ? pr.city : '',
+    pr.state || '', pr.country || ''].filter(Boolean);
+  return [...new Set(parts)].join(', ');
+}
+async function searchPlaces(q){
+  // 1) Photon — great partial matches, biased to the user (or Europe by default).
+  try {
+    const bias = userLoc || { lat:50, lon:10 };        // central Europe if location unknown
+    const url = 'https://photon.komoot.io/api/?' + new URLSearchParams({
+      q, limit:'8', lang:'en', lat:String(bias.lat), lon:String(bias.lon) });
+    const r = await fetch(url);
+    if (r.ok){
+      const j = await r.json();
+      const out = (j.features || []).map(f => {
+        const pr = f.properties || {}, g = (f.geometry && f.geometry.coordinates) || [];
+        if (g.length < 2) return null;
+        if (!pr.name) return null;
+        return { label: photonLabel(pr), name: pr.name,
+                 lon:+g[0], lat:+g[1], cc:(pr.countrycode || '').toUpperCase() };
+      }).filter(Boolean);
+      // de-dupe identical labels
+      const seen = new Set(), uniq = [];
+      for (const o of out){ if (seen.has(o.label)) continue; seen.add(o.label); uniq.push(o); }
+      if (uniq.length) return uniq.slice(0, 7);
+    }
+  } catch(e){ /* fall through to Nominatim */ }
+  // 2) Nominatim fallback.
+  try {
+    const vb = userLoc ? [userLoc.lon-4, userLoc.lat+4, userLoc.lon+4, userLoc.lat-4]
+                       : [-11, 60, 30, 35];
+    const url = 'https://nominatim.openstreetmap.org/search?' + new URLSearchParams({
+      q, format:'json', limit:'7', addressdetails:'1', 'accept-language':'en', viewbox: vb.join(',') });
+    const r = await fetch(url, { headers:{ 'Accept':'application/json' } });
+    const j = await r.json();
+    return (j || []).map(res => ({
+      label: res.display_name, name: res.display_name.split(',')[0],
+      lat:+res.lat, lon:+res.lon,
+      cc:((res.address && res.address.country_code) || '').toUpperCase() }));
+  } catch(e){ return []; }
+}
 function attachAutocomplete(input){
-  let box = null, timer = null;
+  let box = null, timer = null, seq = 0;
   const close = () => { if (box){ box.remove(); box = null; } };
   input.setAttribute('autocomplete', 'off');
   input.addEventListener('focus', askGeo);
@@ -609,34 +685,27 @@ function attachAutocomplete(input){
     delete input.dataset.lat; delete input.dataset.lon;   // typing invalidates a previous pick
     clearTimeout(timer);
     const q = input.value.trim();
-    if (q.length < 3){ close(); return; }
+    if (q.length < 2){ close(); return; }                 // 2 letters is enough for Photon
+    const mine = ++seq;
     timer = setTimeout(async () => {
-      try {
-        // Bias suggestions to the user's location (or Europe by default), so you don't get
-        // American places first — Nominatim prefers results inside the viewbox.
-        const vb = userLoc ? [userLoc.lon-4, userLoc.lat+4, userLoc.lon+4, userLoc.lat-4]
-                           : [-11, 60, 30, 35];
-        const url = 'https://nominatim.openstreetmap.org/search?' +
-          new URLSearchParams({ q, format:'json', limit:'6', addressdetails:'1',
-                                'accept-language':'en', viewbox: vb.join(','), bounded:'0' });
-        const r = await fetch(url, { headers:{ 'Accept':'application/json' } });
-        render(await r.json());
-      } catch(e){ close(); }
-    }, 350);   // debounce — be gentle on the free geocoder
+      const results = await searchPlaces(q);
+      if (mine !== seq) return;                            // a newer keystroke already fired
+      render(results);
+    }, 250);
   });
   input.addEventListener('blur', () => setTimeout(close, 150));
   function render(results){
     close();
     if (!results || !results.length) return;
     box = document.createElement('div'); box.className = 'acbox';
-    results.slice(0,6).forEach(res => {
-      const it = document.createElement('div'); it.className = 'acitem'; it.textContent = res.display_name;
+    results.forEach(res => {
+      const it = document.createElement('div'); it.className = 'acitem'; it.textContent = res.label;
       it.addEventListener('mousedown', e => {          // mousedown fires before blur
         e.preventDefault();
-        input.value = res.display_name.split(',')[0];
+        input.value = res.name;
         input.dataset.lat = res.lat; input.dataset.lon = res.lon;
-        input.dataset.cc = ((res.address && res.address.country_code) || '').toUpperCase();
-        input.dataset.name = input.value;
+        input.dataset.cc = res.cc || '';
+        input.dataset.name = res.name;
         close();
       });
       box.appendChild(it);
@@ -879,49 +948,111 @@ async function addUserStop(lat, lon){
   finally { $('planBtn').disabled = false; }
 }
 
-// Search accommodation within 3 km of a charger (BeachScout-style) via OpenStreetMap/Overpass.
+/* ---------------- accommodation (Stay Nearby) ----------------
+   Borrowed from BeachScout: a full-screen overlay page with a Back button and a scrollable
+   list. Overpass is the data source, but hit through several mirrors with a fallback so a
+   single overloaded server no longer means "it doesn't work". On Back, the found places are
+   drawn on the map as dark-purple dots. */
+const OVERPASS_MIRRORS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
+  'https://overpass.private.coffee/api/interpreter'
+];
+// POST with x-www-form-urlencoded is a "simple" request (no CORS preflight) and dodges URL limits.
+async function overpassQuery(q){
+  let lastErr;
+  for (const url of OVERPASS_MIRRORS){
+    try {
+      const r = await fetch(url, { method:'POST', body:'data=' + encodeURIComponent(q),
+        headers:{ 'Content-Type':'application/x-www-form-urlencoded' } });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return await r.json();
+    } catch(e){ lastErr = e; }   // try the next mirror
+  }
+  throw lastErr || new Error('all Overpass mirrors failed');
+}
+
+let lastStay = [], stayCenter = null;
 async function findAccommodation(lat, lon){
-  clearHotels();
-  showPopup([lon,lat], '<div class="t">🔎 Searching accommodation within 3 km…</div>');
-  const q = `[out:json][timeout:25];(nwr["tourism"~"^(hotel|guest_house|hostel|motel|apartment|chalet|camp_site)$"](around:3000,${lat},${lon}););out center 80;`;
+  if (openPopup){ openPopup.remove(); openPopup = null; }
+  stayCenter = { lat:+lat, lon:+lon };
+  $('stayTitle').textContent = 'Accommodation within 3 km';
+  $('stayStatus').textContent = '🔎 Searching accommodation within 3 km…';
+  $('stayList').innerHTML = '';
+  $('stayPage').classList.add('show');
+  $('stayPage').scrollTop = 0;
+  const q = `[out:json][timeout:40];(` +
+    `nwr["tourism"~"^(hotel|guest_house|apartment|hostel|motel|chalet|cottage|guesthouse|bed_and_breakfast|holiday_home|camp_site|caravan_site)$"](around:3000,${lat},${lon});` +
+    `nwr["amenity"="bed_and_breakfast"](around:3000,${lat},${lon});` +
+    `);out center tags 150;`;
   let j;
-  try { const r = await fetch('https://overpass-api.de/api/interpreter?data=' + encodeURIComponent(q)); j = await r.json(); }
-  catch(e){ showPopup([lon,lat], '<div class="t">Couldn’t reach the accommodation search — try again in a moment.</div>'); return; }
+  try { j = await overpassQuery(q); }
+  catch(e){ $('stayStatus').textContent = 'Couldn’t reach the accommodation search right now — please try again in a moment.'; return; }
   const list = (j.elements || []).map(e => {
     const la = (e.lat != null) ? e.lat : (e.center && e.center.lat);
     const lo = (e.lon != null) ? e.lon : (e.center && e.center.lon);
     if (la == null || lo == null) return null;
     const t = e.tags || {};
-    return { lat:la, lon:lo, name:t.name || 'Accommodation', type:t.tourism || '',
+    return { lat:la, lon:lo, name:t.name || 'Accommodation',
+             type:(t.tourism || t.amenity || '').replace(/_/g,' '), stars:t.stars || '',
              addr:[t['addr:street'], t['addr:housenumber'], t['addr:postcode'], t['addr:city']].filter(Boolean).join(' '),
-             phone:t.phone || t['contact:phone'] || '', website:t.website || t['contact:website'] || '', stars:t.stars || '' };
+             phone:t.phone || t['contact:phone'] || '', website:t.website || t['contact:website'] || '',
+             _d: haversineKm(+lat, +lon, la, lo) };
   }).filter(Boolean);
-  if (openPopup){ openPopup.remove(); openPopup = null; }
-  if (!list.length){ showPopup([lon,lat], '<div class="t">No accommodation mapped within 3 km here — try a nearby stop.</div>'); return; }
-  renderHotels(list);
-  map.flyTo({ center:[lon,lat], zoom: 12 });
-}
-function renderHotels(list){
-  clearHotels();
-  for (const h of list){
-    const el = document.createElement('div'); el.className = 'hotelmark'; el.textContent = '🏨';
-    el.addEventListener('click', ev => { ev.stopPropagation(); showPopup([h.lon,h.lat], hotelHtml(h)); });
-    hotelMarkers.push(new maplibregl.Marker({ element:el, anchor:'center' }).setLngLat([h.lon,h.lat]).addTo(map));
+  list.sort((a,b) => a._d - b._d);
+  lastStay = list;
+  if (!list.length){
+    $('stayStatus').textContent = 'No accommodation mapped within 3 km here — OpenStreetMap coverage is thin in some areas. Try a nearby stop.';
+    return;
   }
+  $('stayStatus').innerHTML = `<b>${list.length}</b> place${list.length>1?'s':''} within 3 km · press <b>← Back to map</b> to see them as <span style="color:#5a2a82">●</span> purple dots.`;
+  $('stayList').innerHTML = list.map(stayCardHtml).join('');
 }
-function hotelHtml(h){
-  const bits = [];
-  const kind = h.type ? esc(h.type.replace(/_/g,' ')) + (h.stars ? ` · ${esc(h.stars)}★` : '') : '';
-  if (kind) bits.push(kind);
-  if (h.addr) bits.push(esc(h.addr));
-  if (h.phone) bits.push(`☎ ${esc(h.phone)}`);
-  if (h.website) bits.push(`<a href="${esc(h.website)}" target="_blank" rel="noopener">Website ↗</a>`);
-  const dir = `https://www.google.com/maps/dir/?api=1&destination=${h.lat},${h.lon}`;   // directions, not a pin
-  return `<h3>🏨 ${esc(h.name)}</h3>
-    <div class="t" style="margin-top:6px">${bits.join('<br>') || 'No further detail in OpenStreetMap'}</div>
-    <div class="t" style="margin-top:6px"><a href="${dir}" target="_blank" rel="noopener">🧭 Directions in Google Maps ↗</a></div>`;
+function stayCardHtml(h){
+  const meta = [];
+  if (h.type) meta.push(esc(h.type) + (h.stars ? ` · ${esc(h.stars)}★` : ''));
+  meta.push(`~${h._d.toFixed(1)} km away`);
+  if (h.addr) meta.push(esc(h.addr));
+  if (h.phone) meta.push('☎ ' + esc(h.phone));
+  const dir = `https://www.google.com/maps/dir/?api=1&destination=${h.lat},${h.lon}`;
+  const web = h.website ? `<div class="t" style="margin-top:4px"><a href="${esc(h.website)}" target="_blank" rel="noopener">Website ↗</a></div>` : '';
+  return `<div class="stay-result"><h3>🏨 ${esc(h.name)}</h3>
+    <div class="t">${meta.join('<br>')}</div>
+    <a class="stay-dir" href="${dir}" target="_blank" rel="noopener">🧭 Directions in Google Maps ↗</a>${web}</div>`;
 }
-function clearHotels(){ hotelMarkers.forEach(m => m.remove()); hotelMarkers = []; }
+// Back to map → close the overlay and drop the found places as dark-purple dots.
+$('stayBack').addEventListener('click', () => {
+  $('stayPage').classList.remove('show');
+  if (lastStay.length) renderStayDots(lastStay, stayCenter);
+});
+function renderStayDots(list, center){
+  clearStayDots();
+  map.addSource('stay-dots', { type:'geojson', data:{ type:'FeatureCollection',
+    features: list.map(h => ({ type:'Feature',
+      properties:{ info: `<h3>🏨 ${esc(h.name)}</h3>` +
+        `<div class="t" style="margin-top:6px">${[h.type?esc(h.type):'', `~${h._d.toFixed(1)} km away`, h.addr?esc(h.addr):''].filter(Boolean).join('<br>')}</div>` +
+        `<div class="t" style="margin-top:6px"><a href="https://www.google.com/maps/dir/?api=1&destination=${h.lat},${h.lon}" target="_blank" rel="noopener">🧭 Directions in Google Maps ↗</a></div>` },
+      geometry:{ type:'Point', coordinates:[h.lon, h.lat] } })) } });
+  map.addLayer({ id:'stay-dots', type:'circle', source:'stay-dots',
+    paint:{ 'circle-radius':['interpolate',['linear'],['zoom'], 9,5, 13,8, 16,12],
+            'circle-color':'#5a2a82', 'circle-opacity':0.95,
+            'circle-stroke-width':2, 'circle-stroke-color':'#fff' } });
+  if (!renderStayDots._bound){                       // bind click/hover once, not per Back-press
+    renderStayDots._bound = true;
+    map.on('click', 'stay-dots', e => showPopup(e.lngLat, e.features[0].properties.info));
+    map.on('mouseenter', 'stay-dots', ()=> map.getCanvas().style.cursor='pointer');
+    map.on('mouseleave', 'stay-dots', ()=> map.getCanvas().style.cursor='');
+  }
+  const lons = list.map(h=>h.lon).concat(center.lon), lats = list.map(h=>h.lat).concat(center.lat);
+  map.fitBounds([[Math.min(...lons),Math.min(...lats)],[Math.max(...lons),Math.max(...lats)]],
+    { padding:70, maxZoom:14 });
+}
+function clearStayDots(){
+  if (map.getLayer('stay-dots')) map.removeLayer('stay-dots');
+  if (map.getSource('stay-dots')) map.removeSource('stay-dots');
+}
+function clearHotels(){ clearStayDots(); hotelMarkers.forEach(m => m.remove()); hotelMarkers = []; }
 
 function clearMap(){
   clearHotels();
