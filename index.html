@@ -120,6 +120,13 @@
   .popbtn.alt{background:#fff;color:var(--accent);border:1.5px solid var(--accent)}
   .endmark{background:#1c1a17;color:#fff;font-family:Georgia,serif;font-size:11px;font-weight:bold;
     padding:2px 7px;border-radius:8px;border:2px solid #fff;box-shadow:0 1px 3px rgba(0,0,0,.4)}
+  /* miniature lightning badges for "alternatives within X km" — white so they pop off the
+     green map; the ring colour encodes power tier */
+  .altmark{width:21px;height:21px;border-radius:50%;background:#fff;display:flex;align-items:center;justify-content:center;
+    font-size:12px;line-height:1;border:2.5px solid #7bbf9c;box-shadow:0 1px 3px rgba(0,0,0,.5);cursor:pointer}
+  .altmark.t0{border-color:#3a8f63}
+  .altmark.t1{border-color:#0a5d2e}
+  .altmark.t2{border-color:#111111}
 
   #start{position:fixed;inset:0;z-index:20;background:var(--paper);overflow-y:auto;display:flex;align-items:center;justify-content:center;padding:22px}
   .start-inner{width:100%;max-width:440px}
@@ -370,7 +377,7 @@ map.addControl(new maplibregl.NavigationControl(), 'top-right');
 // Tap an empty part of the map → offer to show all chargers within 10 km of that point.
 // (Taps that land on a charger/stay/alt dot are left to those layers' own handlers.)
 map.on('click', (e) => {
-  const layers = ['corridor-slow','corridor-fast','corridor-ultra','stay-dots','alt-dots'].filter(l => map.getLayer(l));
+  const layers = ['corridor-slow','corridor-fast','corridor-ultra','stay-dots'].filter(l => map.getLayer(l));
   if (layers.length && map.queryRenderedFeatures(e.point, { layers }).length) return;   // hit a dot
   if (!TRIP || !(TRIP.chargers && TRIP.chargers.length)) return;                          // no data loaded yet
   const { lat, lng } = e.lngLat;
@@ -949,7 +956,7 @@ async function planOnRoute(idx){
 function setBusy(t){ $('busy').textContent = t; }
 
 /* ---------------- render ---------------- */
-let openPopup = null, hotelMarkers = [];
+let openPopup = null, hotelMarkers = [], altMarkers = [];
 function showPopup(lngLat, html){
   if (openPopup) openPopup.remove();
   openPopup = new maplibregl.Popup().setLngLat(lngLat).setHTML(html).addTo(map);
@@ -1175,28 +1182,23 @@ function renderAltDots(list, center, R){
     geometry:{ type:'Point', coordinates:[center.lon, center.lat] } } });
   map.addLayer({ id:'alt-center', type:'circle', source:'alt-center',
     paint:{ 'circle-radius':7, 'circle-color':'#b5471f', 'circle-stroke-width':3, 'circle-stroke-color':'#fff' } });
-  // alternatives, coloured by tier, clickable (add-to-route enabled)
-  map.addSource('alt-dots', { type:'geojson', data:{ type:'FeatureCollection',
-    features: list.map(c => ({ type:'Feature',
-      properties:{ tier: tierOf(c.kw), info: chargerHtml(c, null, true) },
-      geometry:{ type:'Point', coordinates:[c.lon, c.lat] } })) } });
-  map.addLayer({ id:'alt-dots', type:'circle', source:'alt-dots',
-    paint:{ 'circle-radius':['interpolate',['linear'],['zoom'], 8,4, 12,7, 15,11],
-            'circle-color':['match',['get','tier'], 2,'#111111', 1,'#0a5d2e', '#7bbf9c'],
-            'circle-opacity':0.95, 'circle-stroke-width':1.5, 'circle-stroke-color':'#fff' } });
-  if (!renderAltDots._bound){                          // bind once
-    renderAltDots._bound = true;
-    map.on('click', 'alt-dots', e => showPopup(e.lngLat, e.features[0].properties.info));
-    map.on('mouseenter', 'alt-dots', ()=> map.getCanvas().style.cursor='pointer');
-    map.on('mouseleave', 'alt-dots', ()=> map.getCanvas().style.cursor='');
+  // alternatives, as miniature lightning badges coloured by power tier, clickable (add-to-route enabled)
+  for (const c of list){
+    const el = document.createElement('div');
+    el.className = 'altmark t' + tierOf(c.kw);
+    el.textContent = '⚡';
+    el.title = (c.name || 'Charging station') + (c.kw ? ` · ${c.kw} kW` : '');
+    el.addEventListener('click', ev => { ev.stopPropagation(); showPopup([c.lon, c.lat], chargerHtml(c, null, true)); });
+    altMarkers.push(new maplibregl.Marker({ element:el, anchor:'center' }).setLngLat([c.lon, c.lat]).addTo(map));
   }
   const ring = circlePolygon(center.lat, center.lon, R);
   const lons = ring.map(p=>p[0]), lats = ring.map(p=>p[1]);
   map.fitBounds([[Math.min(...lons),Math.min(...lats)],[Math.max(...lons),Math.max(...lats)]], { padding:60 });
 }
 function clearAltDots(){
-  for (const id of ['alt-dots','alt-center','alt-ring-fill','alt-ring-line']) if (map.getLayer(id)) map.removeLayer(id);
-  for (const id of ['alt-dots','alt-center','alt-ring']) if (map.getSource(id)) map.removeSource(id);
+  altMarkers.forEach(m => m.remove()); altMarkers = [];
+  for (const id of ['alt-center','alt-ring-fill','alt-ring-line']) if (map.getLayer(id)) map.removeLayer(id);
+  for (const id of ['alt-center','alt-ring']) if (map.getSource(id)) map.removeSource(id);
 }
 
 function clearMap(){
