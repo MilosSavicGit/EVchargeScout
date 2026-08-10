@@ -117,6 +117,7 @@
     font-family:inherit;font-size:13px;font-weight:bold;cursor:pointer}
   .popbtn.add{background:var(--accent);color:#fff}
   .popbtn.hotel{background:#fff;color:var(--accent2);border:1.5px solid var(--accent2)}
+  .popbtn.alt{background:#fff;color:var(--accent);border:1.5px solid var(--accent)}
   .endmark{background:#1c1a17;color:#fff;font-family:Georgia,serif;font-size:11px;font-weight:bold;
     padding:2px 7px;border-radius:8px;border:2px solid #fff;box-shadow:0 1px 3px rgba(0,0,0,.4)}
 
@@ -143,6 +144,11 @@
   .stay-result .t{color:var(--muted);font-size:12.5px;line-height:1.5;overflow-wrap:anywhere}
   .stay-dir{display:inline-block;margin-top:9px;font-size:14px;font-weight:bold;color:var(--accent2);text-decoration:none}
   .stay-dir:hover{text-decoration:underline}
+  /* radius toggle chips on the "alternatives nearby" overlay */
+  .alt-toggle{display:flex;gap:8px;max-width:640px;margin:0 auto;padding:10px 14px 0}
+  .alt-chip{appearance:none;border:1px solid var(--rule);background:#fff;color:var(--ink);border-radius:999px;
+    padding:8px 15px;font-family:inherit;font-size:15px;cursor:pointer}
+  .alt-chip.on{border-color:var(--accent);background:#eaf6ef;color:var(--accent);font-weight:bold}
 </style>
 </head>
 <body>
@@ -214,6 +220,17 @@
   </div>
   <div class="stay-status" id="stayStatus"></div>
   <div id="stayList" class="stay-list"></div>
+</div>
+
+<!-- ============ NEARBY CHARGING ALTERNATIVES OVERLAY ============ -->
+<div id="altPage" class="stay-page">
+  <div class="stay-header">
+    <button class="stay-back" id="altBack">← Back to map</button>
+    <div class="stay-title" id="altTitle">Charging nearby</div>
+  </div>
+  <div class="alt-toggle" id="altToggle"></div>
+  <div class="stay-status" id="altStatus"></div>
+  <div id="altList" class="stay-list"></div>
 </div>
 
 <script>
@@ -349,6 +366,18 @@ const map = new maplibregl.Map({
   center:[10,48], zoom:4
 });
 map.addControl(new maplibregl.NavigationControl(), 'top-right');
+
+// Tap an empty part of the map → offer to show all chargers within 10 km of that point.
+// (Taps that land on a charger/stay/alt dot are left to those layers' own handlers.)
+map.on('click', (e) => {
+  const layers = ['corridor-slow','corridor-fast','corridor-ultra','stay-dots','alt-dots'].filter(l => map.getLayer(l));
+  if (layers.length && map.queryRenderedFeatures(e.point, { layers }).length) return;   // hit a dot
+  if (!TRIP || !(TRIP.chargers && TRIP.chargers.length)) return;                          // no data loaded yet
+  const { lat, lng } = e.lngLat;
+  showPopup(e.lngLat,
+    `<div class="t">Look for charging around this spot?</div>
+     <button class="popbtn alt" onclick="showAlternatives(${lat},${lng})">⚡ Show chargers within 10 km</button>`);
+});
 
 let stopMarkers = [], endMarkers = [];
 
@@ -1054,8 +1083,125 @@ function clearStayDots(){
 }
 function clearHotels(){ clearStayDots(); hotelMarkers.forEach(m => m.remove()); hotelMarkers = []; }
 
+/* ---------------- nearby charging alternatives (if a charger is down) ----------------
+   Uses the chargers already loaded for the trip (no network call, works offline), so a
+   driver at a dead/occupied charger can instantly see what else is within reach. */
+function tierOf(kw){ kw = (kw===''||kw==null)?0:+kw; return kw>=ULTRA_KW?2:(kw>=FAST_KW?1:0); }
+// A polygon ring approximating a circle of `km` radius (for the radius outline on the map).
+function circlePolygon(lat, lon, km, n){
+  n = n || 72;
+  const dLat = km/111.32, dLon = km/(111.32*Math.cos(lat*Math.PI/180)), ring = [];
+  for (let i=0;i<=n;i++){ const a = 2*Math.PI*i/n; ring.push([lon+dLon*Math.cos(a), lat+dLat*Math.sin(a)]); }
+  return ring;
+}
+let altRadiusKm = 10, altCenter = null, altList = [];
+function showAlternatives(lat, lon){
+  lat = +lat; lon = +lon;
+  // recover the clicked charger's operator (if any) so we can flag same-network options
+  const src = (TRIP && TRIP.chargers || []).find(c => Math.abs(c.lat-lat)<1e-5 && Math.abs(c.lon-lon)<1e-5);
+  altCenter = { lat, lon, op: src ? (src.operator||'') : '' };
+  altRadiusKm = 10;                                   // fresh open always starts at 10 km
+  if (openPopup){ openPopup.remove(); openPopup = null; }
+  $('altPage').classList.add('show');
+  $('altPage').scrollTop = 0;
+  renderAlternatives();
+}
+function renderAltToggle(){
+  const box = $('altToggle'); box.innerHTML = '';
+  [5,10,20].forEach(km => {
+    const b = document.createElement('button');
+    b.className = 'alt-chip' + (km===altRadiusKm ? ' on' : '');
+    b.textContent = km + ' km';
+    b.onclick = () => { altRadiusKm = km; renderAlternatives(); };
+    box.appendChild(b);
+  });
+}
+function renderAlternatives(){
+  const { lat, lon, op } = altCenter, R = altRadiusKm;
+  const all = (TRIP && TRIP.chargers) ? TRIP.chargers : [];
+  const list = [];
+  for (const c of all){
+    if (c.lat==null || c.lon==null) continue;
+    const d = haversineKm(lat, lon, c.lat, c.lon);
+    if (d > R || d < 0.03) continue;                  // outside radius, or the clicked charger itself
+    list.push(Object.assign({}, c, { _d:d }));
+  }
+  list.sort((a,b) => a._d - b._d);
+  altList = list.slice(0, 80);
+  $('altTitle').textContent = `Charging within ${R} km`;
+  renderAltToggle();
+  if (!altList.length){
+    $('altStatus').textContent = `No other chargers within ${R} km in the loaded data — try a wider radius.`;
+    $('altList').innerHTML = '';
+    return;
+  }
+  const fast = altList.filter(c => tierOf(c.kw) >= 1).length;
+  $('altStatus').innerHTML = `<b>${altList.length}</b> charger${altList.length>1?'s':''} within ${R} km · <b>${fast}</b> fast/ultra · press <b>← Back to map</b> to see them on the map. Live availability lives in your charging app — this shows what’s mapped, not real-time status.`;
+  $('altList').innerHTML = altList.map(c => altCardHtml(c, op)).join('');
+}
+function altCardHtml(c, srcOp){
+  const t = tierOf(c.kw);
+  const tierLabel = t===2 ? '⚡⚡ ultra-rapid' : (t===1 ? '⚡ fast DC' : 'AC / slow');
+  const tierColor = t===2 ? '#111111' : (t===1 ? '#0a5d2e' : '#7bbf9c');
+  const apps = appsFor(`${c.operator||''} ${c.name||''}`);
+  const sameOp = srcOp && c.operator && c.operator.toLowerCase() === srcOp.toLowerCase();
+  const meta = [];
+  meta.push(`<span style="color:${tierColor};font-weight:bold">${tierLabel}${c.kw?` · ${esc(c.kw)} kW`:''}</span>`);
+  meta.push(`~${c._d.toFixed(1)} km away`);
+  if (c.operator) meta.push('Operator: ' + esc(c.operator) + (sameOp ? ' <span style="color:#b5471f">· same network</span>' : ''));
+  meta.push(`Charging: ${c.cost ? esc(c.cost) : 'cost not listed'}`);
+  meta.push(apps.length ? `Apps: ${esc(apps.join(', '))}` : `Apps: roaming (${ROAMING_APPS})`);
+  const dir = `https://www.google.com/maps/dir/?api=1&destination=${c.lat},${c.lon}`;
+  return `<div class="stay-result"><h3>⚡ ${esc(c.name||'Charging station')}</h3>
+    <div class="t">${meta.join('<br>')}</div>
+    <a class="stay-dir" href="${dir}" target="_blank" rel="noopener">🧭 Directions in Google Maps ↗</a></div>`;
+}
+// Back to map → close the overlay, draw the radius ring and the alternatives as tier-coloured dots.
+$('altBack').addEventListener('click', () => {
+  $('altPage').classList.remove('show');
+  if (altCenter && altList.length) renderAltDots(altList, altCenter, altRadiusKm);
+});
+function renderAltDots(list, center, R){
+  clearAltDots();
+  // radius ring
+  map.addSource('alt-ring', { type:'geojson', data:{ type:'Feature',
+    geometry:{ type:'Polygon', coordinates:[circlePolygon(center.lat, center.lon, R)] } } });
+  map.addLayer({ id:'alt-ring-fill', type:'fill', source:'alt-ring',
+    paint:{ 'fill-color':'#0a7d4d', 'fill-opacity':0.06 } });
+  map.addLayer({ id:'alt-ring-line', type:'line', source:'alt-ring',
+    paint:{ 'line-color':'#0a7d4d', 'line-width':1.5, 'line-dasharray':[2,2], 'line-opacity':0.75 } });
+  // centre marker (the spot the driver is at)
+  map.addSource('alt-center', { type:'geojson', data:{ type:'Feature',
+    geometry:{ type:'Point', coordinates:[center.lon, center.lat] } } });
+  map.addLayer({ id:'alt-center', type:'circle', source:'alt-center',
+    paint:{ 'circle-radius':7, 'circle-color':'#b5471f', 'circle-stroke-width':3, 'circle-stroke-color':'#fff' } });
+  // alternatives, coloured by tier, clickable (add-to-route enabled)
+  map.addSource('alt-dots', { type:'geojson', data:{ type:'FeatureCollection',
+    features: list.map(c => ({ type:'Feature',
+      properties:{ tier: tierOf(c.kw), info: chargerHtml(c, null, true) },
+      geometry:{ type:'Point', coordinates:[c.lon, c.lat] } })) } });
+  map.addLayer({ id:'alt-dots', type:'circle', source:'alt-dots',
+    paint:{ 'circle-radius':['interpolate',['linear'],['zoom'], 8,4, 12,7, 15,11],
+            'circle-color':['match',['get','tier'], 2,'#111111', 1,'#0a5d2e', '#7bbf9c'],
+            'circle-opacity':0.95, 'circle-stroke-width':1.5, 'circle-stroke-color':'#fff' } });
+  if (!renderAltDots._bound){                          // bind once
+    renderAltDots._bound = true;
+    map.on('click', 'alt-dots', e => showPopup(e.lngLat, e.features[0].properties.info));
+    map.on('mouseenter', 'alt-dots', ()=> map.getCanvas().style.cursor='pointer');
+    map.on('mouseleave', 'alt-dots', ()=> map.getCanvas().style.cursor='');
+  }
+  const ring = circlePolygon(center.lat, center.lon, R);
+  const lons = ring.map(p=>p[0]), lats = ring.map(p=>p[1]);
+  map.fitBounds([[Math.min(...lons),Math.min(...lats)],[Math.max(...lons),Math.max(...lats)]], { padding:60 });
+}
+function clearAltDots(){
+  for (const id of ['alt-dots','alt-center','alt-ring-fill','alt-ring-line']) if (map.getLayer(id)) map.removeLayer(id);
+  for (const id of ['alt-dots','alt-center','alt-ring']) if (map.getSource(id)) map.removeSource(id);
+}
+
 function clearMap(){
   clearHotels();
+  clearAltDots();
   if (openPopup){ openPopup.remove(); openPopup = null; }
   stopMarkers.forEach(m => m.remove()); stopMarkers = [];
   endMarkers.forEach(m => m.remove()); endMarkers = [];
@@ -1087,10 +1233,12 @@ function chargerHtml(c, stopNo, canAdd){
   const hasLoc = c.lat != null && c.lon != null;
   const addBtn = (canAdd && hasLoc)
     ? `<button class="popbtn add" onclick="addUserStop(${(+c.lat)},${(+c.lon)})">➕ Add this stop to my route</button>` : '';
+  const altBtn = hasLoc
+    ? `<button class="popbtn alt" onclick="showAlternatives(${(+c.lat)},${(+c.lon)})">⚡ This one down? Alternatives within 10 km</button>` : '';
   const hotelBtn = hasLoc
     ? `<button class="popbtn hotel" onclick="findAccommodation(${(+c.lat)},${(+c.lon)})">🏨 Accommodation within 3 km</button>` : '';
   return `<h3>${head}</h3>${sub}<div class="t" style="margin-top:6px">${bits.join('<br>')}</div>
-    <div class="t" style="margin-top:6px">Data: Open Charge Map</div>${addBtn}${hotelBtn}`;
+    <div class="t" style="margin-top:6px">Data: Open Charge Map</div>${addBtn}${altBtn}${hotelBtn}`;
 }
 
 function renderTrip(info){
