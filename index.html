@@ -36,7 +36,13 @@
     /* 16px inputs stop iOS Safari zooming in (which made the windows look too big) */
     .field input, .carsel{font-size:16px}
   }
-  @media(max-width:480px){ #start{padding:16px} .brand{font-size:28px} }
+  @media(max-width:480px){
+    #start{padding:14px} .brand{font-size:28px}
+    .panel{padding:12px}                 /* ~5mm narrower content on iPhone */
+    .card{padding:10px}
+  }
+  /* long place names / operators must wrap, never push the layout wider than the screen */
+  .note,.foot,.stopmeta,.stopname,.row,.acitem,.warn{overflow-wrap:anywhere;word-break:break-word}
 
   /* place-search suggestions dropdown */
   .field{position:relative}
@@ -224,6 +230,21 @@ const OPERATOR_APPS = {
   'fortum':['Fortum'], 'recharge':['Recharge'], 'duferco':['Duferco energia']
 };
 const ROAMING_APPS = 'Chargemap, Plugsurfing, Shell Recharge';
+
+// Ballpark fast-DC price for a rough cost estimate (real prices vary a lot by network/country).
+const EUR_PER_KWH = 0.55;
+
+// Countries that require a vignette / e-toll sticker — with their OFFICIAL online shops.
+const VIGNETTE = {
+  at:{ name:'Austria',     url:'https://www.asfinag.at/en/' },
+  ch:{ name:'Switzerland', url:'https://via.admin.ch/' },
+  cz:{ name:'Czechia',     url:'https://www.edalnice.cz/en/' },
+  sk:{ name:'Slovakia',    url:'https://www.eznamka.sk/en/' },
+  si:{ name:'Slovenia',    url:'https://evinjeta.dars.si/en/' },
+  hu:{ name:'Hungary',     url:'https://ematrica.nemzetiutdij.hu/' },
+  ro:{ name:'Romania',     url:'https://www.erovinieta.ro/' },
+  bg:{ name:'Bulgaria',    url:'https://bgtoll.bg/en/' }
+};
 function appsFor(operator){
   if (!operator) return [];
   const s = operator.toLowerCase(), out = [];
@@ -571,10 +592,19 @@ function addStopField(value){
 $('addStop').addEventListener('click', () => addStopField(''));
 
 /* ---------------- place-search autocomplete (Nominatim) ---------------- */
+let userLoc = null, geoAsked = false;
+function askGeo(){                                    // once, when a search box is focused
+  if (geoAsked || !navigator.geolocation) return;
+  geoAsked = true;
+  navigator.geolocation.getCurrentPosition(
+    p => { userLoc = { lat:p.coords.latitude, lon:p.coords.longitude }; },
+    () => {}, { timeout:8000, maximumAge:600000 });
+}
 function attachAutocomplete(input){
   let box = null, timer = null;
   const close = () => { if (box){ box.remove(); box = null; } };
   input.setAttribute('autocomplete', 'off');
+  input.addEventListener('focus', askGeo);
   input.addEventListener('input', () => {
     delete input.dataset.lat; delete input.dataset.lon;   // typing invalidates a previous pick
     clearTimeout(timer);
@@ -582,8 +612,13 @@ function attachAutocomplete(input){
     if (q.length < 3){ close(); return; }
     timer = setTimeout(async () => {
       try {
+        // Bias suggestions to the user's location (or Europe by default), so you don't get
+        // American places first — Nominatim prefers results inside the viewbox.
+        const vb = userLoc ? [userLoc.lon-4, userLoc.lat+4, userLoc.lon+4, userLoc.lat-4]
+                           : [-11, 60, 30, 35];
         const url = 'https://nominatim.openstreetmap.org/search?' +
-          new URLSearchParams({ q, format:'json', limit:'6', addressdetails:'1', 'accept-language':'en' });
+          new URLSearchParams({ q, format:'json', limit:'6', addressdetails:'1',
+                                'accept-language':'en', viewbox: vb.join(','), bounded:'0' });
         const r = await fetch(url, { headers:{ 'Accept':'application/json' } });
         render(await r.json());
       } catch(e){ close(); }
@@ -799,6 +834,7 @@ async function planOnRoute(idx){
     const nextPos = (i+1 < result.stops.length) ? result.stops[i+1].pos : L;
     const legKm = Math.max(0, (nextPos - s.pos) * det);
     const energy = Math.min(consumption * legKm, car.batt * 0.8);
+    s.addKWh = energy;
     const eff = Math.min((+s.kw || 50), car.maxkw) * 0.85;
     s.chargeMin = eff > 0 ? energy / eff * 60 : null;
     if (s.chargeMin) chargeH += s.chargeMin / 60;
@@ -931,6 +967,9 @@ function renderTrip(info){
           ferryMin, ferryName, routeIdx, nDays, maxHours } = info;
   clearMap();
   const { stops, corridor, L, reachedEnd } = result;
+  let costTotal = 0;
+  stops.forEach(s => { const free = s.cost && /free/i.test(s.cost); costTotal += free ? 0 : (s.addKWh||0)*EUR_PER_KWH; });
+  const vig = countriesAlong(routeGeo).filter(c => VIGNETTE[c]);   // vignette countries on the route
 
   // route line (real road geometry when routing succeeded; straight otherwise)
   map.addSource('route', { type:'geojson', data:{ type:'Feature',
@@ -1018,6 +1057,7 @@ function renderTrip(info){
       <span><b>Total trip time</b></span><b style="color:var(--accent)">${fmtDur((drivingH||0)+(chargeH||0))}</b></div>`;
   if (nDays > 1)
     html += `<div class="row"><span>Days (driving)</span><b>${nDays} · ~${maxHours}h/day max</b></div>`;
+  html += `<div class="row"><span>Est. charging cost</span><b>~€${Math.round(costTotal)} <span style="color:var(--muted);font-weight:normal">ballpark</span></b></div>`;
 
   if (!stops.length && reachedEnd){
     html += `<div class="ok">You can make this trip on a single charge — no stops needed
@@ -1029,6 +1069,14 @@ function renderTrip(info){
     html += `<div class="warn">⚠ There's a stretch with no reachable charger within your range.
       Charge to full before it, slow down to extend range, or add a stop along the way to pull in
       more chargers. The plan below covers the route up to that gap.</div>`;
+  }
+
+  // Vignette / road-toll warning for countries the route crosses (buy BEFORE you go).
+  if (vig.length){
+    html += `<div class="warn" style="background:#fff4e6;border-color:#e0b878;color:#7a4a12">
+      🛣️ <b>Vignette / road toll required</b> for
+      ${vig.map(c => `<a href="${VIGNETTE[c].url}" target="_blank" rel="noopener">${esc(VIGNETTE[c].name)}</a>`).join(', ')}.
+      Buy the <b>official</b> e-vignette <b>before you cross the border</b> — use the official links here, not third-party resellers.</div>`;
   }
 
   if (stops.length){
@@ -1043,7 +1091,8 @@ function renderTrip(info){
 
       const km = Math.round(s.pos * det);
       const kw = s.kw ? `${s.kw} kW` : 'kW n/a';
-      const cost = s.cost ? esc(s.cost) : 'cost not listed';
+      const cost = s.cost ? esc(s.cost)
+                 : (s.addKWh ? `~€${Math.round(s.addKWh*EUR_PER_KWH)} est` : 'cost not listed');
       const place = s.place ? esc(s.place) : esc(s.name || 'Charging station');
       const chargerName = s.place ? `<br><span style="color:#6a6152">${esc(s.name||'Charging station')}</span>` : '';
       const chg = s.chargeMin ? ` · ~${Math.round(s.chargeMin)} min charge` : '';
