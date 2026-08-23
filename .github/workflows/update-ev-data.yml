@@ -1,0 +1,108 @@
+# .github/workflows/update-ev-data.yml
+#
+# Weekly EV charger refresh from Open Charge Map.
+#
+# Runs on GitHub's machines, so it does not need your PC to be awake, and it
+# commits straight to main - GitHub Pages redeploys on its own.
+#
+# SETUP (once):
+#   1. Repo -> Settings -> Secrets and variables -> Actions -> New repository secret
+#      Name: OCM_API_KEY      Value: your Open Charge Map key
+#   2. Repo -> Settings -> Actions -> General -> Workflow permissions
+#      -> "Read and write permissions"  (needed to commit the refreshed data)
+#
+# Weekly runs are DELTAS (--since auto), which is what makes this polite: OCM
+# ask callers not to re-download the world, and reserve the right to ban for
+# excessive use. A delta asks only for what changed since each file was built.
+#
+# A delta can never see a DELETED charger - OCM just stops returning it. So the
+# first run of each month is a full rebuild instead, which does catch removals.
+
+name: Update EV charger data
+
+on:
+  schedule:
+    # 03:00 UTC Sunday. Quiet hours in the UK, where OCM is hosted.
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+    inputs:
+      full:
+        description: 'Full rebuild instead of a delta'
+        type: boolean
+        default: false
+
+# Never let two runs commit at once.
+concurrency:
+  group: update-ev-data
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Decide delta or full rebuild
+        id: mode
+        run: |
+          # Manual runs honour the checkbox. Scheduled runs go full on the
+          # first Sunday of the month so removals get picked up.
+          if [ "${{ github.event.inputs.full }}" = "true" ]; then
+            echo "args=" >> "$GITHUB_OUTPUT"
+            echo "why=full (requested)" >> "$GITHUB_OUTPUT"
+          elif [ "$(date -u +%d)" -le 07 ]; then
+            echo "args=" >> "$GITHUB_OUTPUT"
+            echo "why=full (first Sunday of the month)" >> "$GITHUB_OUTPUT"
+          else
+            echo "args=--since auto" >> "$GITHUB_OUTPUT"
+            echo "why=delta" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        env:
+          OCM_API_KEY: ${{ secrets.OCM_API_KEY }}
+        run: |
+          echo "Mode: ${{ steps.mode.outputs.why }}"
+          python build_ev.py --all ${{ steps.mode.outputs.args }}
+
+      - name: Sanity check before committing
+        run: |
+          # A partial or empty result is worse than stale data, because it
+          # would ship and look fine. Refuse to commit an obviously broken run.
+          python - <<'PY'
+          import json, glob, os, sys
+          files = [f for f in glob.glob('ev/*.json') if not f.endswith('ev.json')]
+          if len(files) < 40:
+              sys.exit(f"only {len(files)} country files - expected ~47")
+          total = 0
+          empty = []
+          for f in files:
+              d = json.load(open(f, encoding='utf-8'))
+              n = d.get('count', 0)
+              total += n
+              if n == 0:
+                  empty.append(os.path.basename(f))
+          print(f"{len(files)} files, {total:,} chargers")
+          if empty:
+              print("empty:", ", ".join(empty))
+          if total < 100000:
+              sys.exit(f"only {total:,} chargers total - refusing to commit")
+          PY
+
+      - name: Commit if anything changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ev/ index.html
+          if git diff --staged --quiet; then
+            echo "No changes - nothing to commit."
+            exit 0
+          fi
+          git commit -m "EV data refresh (${{ steps.mode.outputs.why }}) — data © Open Charge Map contributors"
+          git push
