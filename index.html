@@ -131,6 +131,11 @@
   #start{position:fixed;inset:0;z-index:20;background:var(--paper);overflow-y:auto;display:flex;align-items:center;justify-content:center;padding:22px}
   .start-inner{width:100%;max-width:440px}
   .brand{font-size:32px;margin:0 0 2px}
+  /* Sits inside the range label, so the unit is never ambiguous at the one
+     input where getting it wrong actually matters. */
+  .unit-toggle{float:right;display:inline-flex;border:1px solid var(--rule);border-radius:999px;overflow:hidden}
+  .unit-toggle button{font:inherit;font-size:11px;padding:2px 9px;border:0;background:#fff;color:var(--muted);cursor:pointer;line-height:1.6}
+  .unit-toggle button.on{background:var(--accent);color:#fff}
   .foot{font-size:11px;color:var(--muted);line-height:1.5;margin-top:16px;border-top:1px solid var(--rule);padding-top:12px}
   .foot a{color:var(--accent2)}
   .busy{font-size:12px;color:var(--muted);min-height:16px;margin-top:6px}
@@ -164,7 +169,8 @@
 <div id="start">
   <div class="start-inner">
     <h1 class="brand">EVchargeScout</h1>
-    <p class="sub">Tell it where you're driving and how far your car goes — it plans the charging stops.</p>
+    <p class="sub">Tell it where you're driving and how far your car goes — it plans the charging stops.<br>
+      <span id="versionTag" style="font-size:11px;opacity:.65"></span></p>
 
     <div class="field">
       <label>Start</label>
@@ -182,8 +188,12 @@
       <div id="carSpec" class="note" style="margin-top:4px"></div>
     </div>
     <div class="field">
-      <label>Range on a full charge (km)</label>
-      <input id="fRange" type="number" min="50" max="1000" step="10" value="475">
+      <label>Range on a full charge (<span id="rangeUnit">km</span>)
+        <span id="unitToggle" class="unit-toggle">
+          <button type="button" data-u="km" class="on">km</button><button type="button" data-u="mi">miles</button>
+        </span>
+      </label>
+      <input id="fRange" type="number" min="1" max="1000" step="10" value="475">
     </div>
     <div class="field" id="manualSpec" style="display:none">
       <label>Battery (usable kWh) &amp; max DC (kW) — for the charging-time estimate</label>
@@ -249,6 +259,83 @@
 
 const $ = id => document.getElementById(id);
 
+/* Bump EV_DATA_VERSION EVERY time the ev/*.json charger files are rebuilt.
+   It is appended to every charger fetch as a cache-buster. Without it the
+   force-cache below means a returning user keeps the charger file their browser
+   first downloaded - forever, silently. On a beach app that is stale data; here
+   it is routing somebody to a charger that was decommissioned months ago.
+   EV_DATA_VERSION_LINE - do not rename this marker. */
+const EV_DATA_VERSION = "2026-08-22";
+
+/* Shown in the corner of the start screen and logged to the console. Bump on
+   every release, so a running app can always be identified from a screenshot. */
+const BUILD_VERSION = "1.0.2 (2026-08-23)";
+console.log("%cEVchargeScout build: " + BUILD_VERSION + " \u00b7 charger data " + EV_DATA_VERSION,
+            "font-weight:bold");
+
+/* ------------------------------------------------------------------
+   UNITS
+   Every distance inside the planner is kilometres, always. This module
+   only governs what the user reads and what the range box is understood
+   to mean. Keeping one internal unit is what stops a conversion getting
+   applied twice somewhere and quietly ruining a plan.
+
+   The toggle is authoritative. Locale only seeds its opening position,
+   so an American does not have to change it every time, and nothing is
+   ever decided behind the user's back.
+   ------------------------------------------------------------------ */
+const KM_PER_MILE = 1.609344;
+const UNIT_KEY = 'evcs_units';
+
+function seedUnits(){
+  try{
+    const saved = localStorage.getItem(UNIT_KEY);
+    if (saved === 'km' || saved === 'mi') return saved;
+  }catch(e){}
+  // Road signs in miles: United States and United Kingdom (plus Liberia
+  // and Myanmar). Canada is metric for driving - km and km/h - even though
+  // Canadians use pounds and feet elsewhere. Do not add CA here.
+  let region = '';
+  try{ region = (new Intl.Locale(navigator.language).region || '').toUpperCase(); }
+  catch(e){
+    const m = /[-_]([A-Za-z]{2})\b/.exec(navigator.language || '');
+    region = m ? m[1].toUpperCase() : '';
+  }
+  return ['US','GB','LR','MM'].includes(region) ? 'mi' : 'km';
+}
+
+let UNITS = seedUnits();
+
+function unitLabel(){ return UNITS === 'mi' ? 'miles' : 'km'; }
+function unitShort(){ return UNITS === 'mi' ? 'mi' : 'km'; }
+
+/* km -> the number the user should see (unrounded). */
+function toDisp(km){ return UNITS === 'mi' ? km / KM_PER_MILE : km; }
+/* what the user typed -> km for the planner. */
+function toKm(v){ return UNITS === 'mi' ? v * KM_PER_MILE : v; }
+
+/* Formatted distance with unit. Short hops keep a decimal because "0 km away"
+   is useless; anything from 10 up is rounded, since a tenth of a mile of
+   precision on a 600 km drive is false confidence. */
+function fmtDist(km, force){
+  const v = toDisp(km);
+  const dec = (force === 1) || (force !== 0 && v < 10);
+  return (dec ? v.toFixed(1) : Math.round(v).toLocaleString()) + ' ' + unitShort();
+}
+
+/* Radius chips. Native round numbers in each system rather than converted
+   ones - "12 mi" reads properly, "12.4 mi" reads like a bug. */
+function radiusChoices(){
+  return UNITS === 'mi'
+    ? [{km:  3*KM_PER_MILE, label:'3 mi'},
+       {km:  6*KM_PER_MILE, label:'6 mi'},
+       {km: 12*KM_PER_MILE, label:'12 mi'}]
+    : [{km: 5,  label:'5 km'},
+       {km:10,  label:'10 km'},
+       {km:20,  label:'20 km'}];
+}
+function defaultRadiusKm(){ return radiusChoices()[1].km; }
+
 /* Planning constants (see the ParkingScout roadmap for rationale). */
 const SAFETY   = 0.80;   // use 80% of stated range — real range drops with cold/hills/speed
 const DETOUR   = 1.25;   // roads aren't straight: inflate along-route distance to ~driving distance
@@ -286,6 +373,54 @@ const ROAMING_APPS = 'Chargemap, Plugsurfing, Shell Recharge';
 
 // Ballpark fast-DC price for a rough cost estimate (real prices vary a lot by network/country).
 const EUR_PER_KWH = 0.55;
+
+/* ------------------------------------------------------------------
+   HOW MUCH TO TRUST OCM's COST FIELD
+
+   UsageCost is free text a contributor typed by hand, with no expiry and
+   no verification. Most of it is fine. One value is not: "Free".
+
+   Free AC at a supermarket or hotel is completely real and common. Free
+   DC fast charging on a motorway essentially is not. The Tesla site at
+   Herzsprung on the A24 was listed "Free" in the data while Tesla
+   publishes two paid tariffs for it - and because a free claim also fed
+   zero into the trip total, the whole journey came out cheaper than it
+   could possibly be.
+
+   That is the one cost error a driver plans around, so:
+     - a free claim on slow AC is believed and shown as-is
+     - a free claim on DC is NOT believed: we show our own estimate and
+       say plainly what OCM claimed, hiding neither
+     - any other cost text is shown exactly as written
+     - no cost text at all means expect the usual rate, not free
+   ------------------------------------------------------------------ */
+const FREE_RE = /(^|\W)(free|kostenlos|gratis|gratuit|gratuito|gratuita|besplatno|ingyenes|zdarma|darmowe|no charge|0\s*(€|eur))(\W|$)/i;
+
+// Above this, "free" is not credible. 22 kW is the top of normal AC.
+const FREE_TRUST_MAX_KW = 22;
+
+function freeClaim(c){ return !!(c && c.cost && FREE_RE.test(c.cost)); }
+function freeTrusted(c){ return freeClaim(c) && (+c.kw || 0) <= FREE_TRUST_MAX_KW; }
+
+/* What the user should actually pay, in euros, for a given top-up.
+   Only a believable free claim costs nothing. */
+function costOf(c, addKWh){
+  if (freeTrusted(c)) return 0;
+  return (addKWh || 0) * EUR_PER_KWH;
+}
+
+const UNVERIFIED = '<span style="color:#c77d0a">OCM lists “free” — unverified, expect to pay</span>';
+
+/* One line of cost text. addKWh is optional: without it there is no session
+   estimate to give, so we quote the per-kWh ballpark instead. */
+function costLabel(c, addKWh){
+  const est = addKWh ? `~€${Math.round(addKWh * EUR_PER_KWH)} est`
+                     : `expect ~€${EUR_PER_KWH.toFixed(2)}/kWh`;
+  if (freeTrusted(c)) return esc(c.cost);            // plausible - believe it
+  if (freeClaim(c))   return `${est} · ${UNVERIFIED}`;
+  if (c.cost)         return esc(c.cost);            // real price info - keep it
+  return `not listed · ${est}`;
+}
 
 // Countries that require a vignette / e-toll sticker — with their OFFICIAL online shops.
 const VIGNETTE = {
@@ -383,7 +518,7 @@ map.on('click', (e) => {
   const { lat, lng } = e.lngLat;
   showPopup(e.lngLat,
     `<div class="t">Look for charging around this spot?</div>
-     <button class="popbtn alt" onclick="showAlternatives(${lat},${lng})">⚡ Show chargers within 10 km</button>`);
+     <button class="popbtn alt" onclick="showAlternatives(${lat},${lng})">⚡ Show chargers within ${fmtDist(defaultRadiusKm(), 0)}</button>`);
 });
 
 let stopMarkers = [], endMarkers = [];
@@ -458,17 +593,51 @@ function planStops(routeXY, segCum, L, chargers, rangeKm, det, forced){
 
 /* ---------------- data loading ---------------- */
 const countryCache = {};
+
+/* Countries whose file we could not FETCH this session - as opposed to
+   countries we fetched and found nothing for. Cleared per attempt.
+
+   BUG THIS REPLACES, in two parts:
+
+   (a) A failed fetch was written into countryCache exactly like a real answer.
+       Because [] is truthy in JavaScript, the `if (countryCache[cc])` guard
+       above then returned that empty list forever. One moment offline killed
+       that country for the whole session, with no retry even after the
+       connection came back.
+
+   (b) Far more serious here than in a beach app: the caller concatenated all
+       the country lists and only checked whether the TOTAL was empty. So a
+       partial failure was invisible. Plan Copenhagen to Belgrade with de.json
+       unreachable and you got chargers for Denmark, Czechia, Austria, Hungary
+       and Serbia - and a 700 km hole through Germany that nothing reported.
+       The planner would either call the trip impossible or route somebody
+       across Germany with no stops planned. This app's whole premise is not
+       running flat; silently planning around missing data contradicts it. */
+const countryLoadFailed = new Set();
+
 async function loadCountry(cc){
   cc = (cc||'').toLowerCase();
   if (!cc) return [];
   if (countryCache[cc]) return countryCache[cc];
   try {
-    const r = await fetch(`ev/${cc}.json`, { cache:'force-cache' });
-    if (!r.ok){ countryCache[cc] = []; return []; }
+    // The ?v= is what breaks the cache. force-cache without it is permanent.
+    const r = await fetch(`ev/${cc}.json?v=${EV_DATA_VERSION}`, { cache:'force-cache' });
+    if (!r.ok){
+      // A real answer: there is no file for this country. It will not appear
+      // later in the session, so caching the empty list is correct.
+      countryCache[cc] = [];
+      return [];
+    }
     const j = await r.json();
     countryCache[cc] = j.chargers || [];
     return countryCache[cc];
-  } catch(e){ countryCache[cc] = []; return []; }
+  } catch(e){
+    // Never reached the server, so nothing was learned about this country.
+    // Do NOT cache - not caching is all the retry logic needed, since the next
+    // attempt simply asks again.
+    countryLoadFailed.add(cc);
+    return [];
+  }
 }
 
 async function geocode(q){
@@ -765,7 +934,7 @@ let CARS = [];
 
 async function loadCars(){
   try {
-    const r = await fetch('ev-cars.json');
+    const r = await fetch(`ev-cars.json?v=${EV_DATA_VERSION}`);
     const j = await r.json();
     CARS = j.cars || [];
   } catch(e){
@@ -780,7 +949,7 @@ async function loadCars(){
     for (const c of byBrand[brand]){
       const o = document.createElement('option');
       o.value = `${c.brand} ${c.model}`;
-      o.textContent = `${c.model} — ~${c.range} km`;
+      o.textContent = `${c.model} — ~${fmtDist(c.range, 0)}`;
       o.dataset.batt = c.battery; o.dataset.range = c.range; o.dataset.maxkw = c.maxkw;
       og.appendChild(o);
     }
@@ -799,14 +968,16 @@ function onCarChange(){
     $('carSpec').textContent = 'Enter battery (usable kWh), max DC (kW) and range for your model.';
     return;
   }
-  $('fRange').value = o.dataset.range;
+  // dataset.range is km from ev-cars.json; the box shows the user's unit.
+  $('fRange').value = Math.round(toDisp(+o.dataset.range));
   $('manualSpec').style.display = 'none';
-  $('carSpec').innerHTML = `<b>${o.dataset.batt} kWh</b> usable · <b>${o.dataset.maxkw} kW</b> max DC · ~${o.dataset.range} km WLTP`;
+  $('carSpec').innerHTML = `<b>${o.dataset.batt} kWh</b> usable · <b>${o.dataset.maxkw} kW</b> max DC · ~${fmtDist(+o.dataset.range, 0)} WLTP`;
 }
 // Resolve the car for planning: from the dropdown, or manual fields / an estimate.
 function resolveCar(){
   const o = $('fCar').selectedOptions[0];
-  const rangeKm = Math.max(50, +$('fRange').value || 0);
+  // The box is in whatever the toggle says; the planner is always in km.
+  const rangeKm = Math.max(50, toKm(+$('fRange').value || 0));
   if (o && o.value !== 'custom')
     return { model:o.value, batt:+o.dataset.batt, maxkw:+o.dataset.maxkw, rangeKm, known:true };
   const batt = +$('fBatt').value || (rangeKm * 0.16);
@@ -828,7 +999,7 @@ async function planTrip(){
   const maxHours = +$('fMaxDay').value || 0;   // 0 = one push, no overnight splits
   const viaEls = [...$('stops').querySelectorAll('input')].filter(i => i.value.trim());
   if (!startQ || !endQ){ setBusy('Enter a start and a destination.'); return; }
-  if (!car.rangeKm){ setBusy('Enter your car’s range in km.'); return; }
+  if (!car.rangeKm){ setBusy('Enter your car’s range in ' + unitLabel() + '.'); return; }
 
   setBusy('Finding your places…'); $('planBtn').disabled = true;
   try {
@@ -876,8 +1047,23 @@ async function computeAndRender(){
   for (const rt of routes)
     (realRoad ? countriesAlong(rt.coords) : routeCountries(pts)).forEach(c => ccSet.add(c));
   pts.forEach(p => { if (p.cc) ccSet.add(p.cc.toLowerCase()); });
+
+  countryLoadFailed.clear();                       // fresh attempt
   const lists = await Promise.all([...ccSet].map(loadCountry));
   const chargers = [].concat(...lists);
+
+  // A country we could not reach is a hole in the route, not a country without
+  // chargers. Planning around it would produce a confident plan with a gap in
+  // the middle - the one failure this app exists to prevent. Say so and stop.
+  const missing = [...ccSet].filter(cc => countryLoadFailed.has(cc));
+  if (missing.length){
+    setBusy('Could not load charger data for '
+      + missing.map(c => c.toUpperCase()).join(', ')
+      + '. Your route crosses ' + (missing.length > 1 ? 'those countries' : 'that country')
+      + ', so the plan would have a gap in it. Check your connection and press Plan again.');
+    return;
+  }
+
   if (!chargers.length){
     setBusy('No charger data for this route yet (Europe, North America & Australia are covered).');
     return;
@@ -1013,8 +1199,8 @@ let lastStay = [], stayCenter = null;
 async function findAccommodation(lat, lon){
   if (openPopup){ openPopup.remove(); openPopup = null; }
   stayCenter = { lat:+lat, lon:+lon };
-  $('stayTitle').textContent = 'Accommodation within 3 km';
-  $('stayStatus').textContent = '🔎 Searching accommodation within 3 km…';
+  $('stayTitle').textContent = 'Accommodation within ' + fmtDist(3, 0);
+  $('stayStatus').textContent = '🔎 Searching accommodation within ' + fmtDist(3, 0) + '…';
   $('stayList').innerHTML = '';
   $('stayPage').classList.add('show');
   $('stayPage').scrollTop = 0;
@@ -1039,16 +1225,16 @@ async function findAccommodation(lat, lon){
   list.sort((a,b) => a._d - b._d);
   lastStay = list;
   if (!list.length){
-    $('stayStatus').textContent = 'No accommodation mapped within 3 km here — OpenStreetMap coverage is thin in some areas. Try a nearby stop.';
+    $('stayStatus').textContent = 'No accommodation mapped within ' + fmtDist(3, 0) + ' here — OpenStreetMap coverage is thin in some areas. Try a nearby stop.';
     return;
   }
-  $('stayStatus').innerHTML = `<b>${list.length}</b> place${list.length>1?'s':''} within 3 km · press <b>← Back to map</b> to see them as <span style="color:#5a2a82">●</span> purple dots.`;
+  $('stayStatus').innerHTML = `<b>${list.length}</b> place${list.length>1?'s':''} within ${fmtDist(3, 0)} · press <b>← Back to map</b> to see them as <span style="color:#5a2a82">●</span> purple dots.`;
   $('stayList').innerHTML = list.map(stayCardHtml).join('');
 }
 function stayCardHtml(h){
   const meta = [];
   if (h.type) meta.push(esc(h.type) + (h.stars ? ` · ${esc(h.stars)}★` : ''));
-  meta.push(`~${h._d.toFixed(1)} km away`);
+  meta.push(`~${fmtDist(h._d, 1)} away`);
   if (h.addr) meta.push(esc(h.addr));
   if (h.phone) meta.push('☎ ' + esc(h.phone));
   const dir = `https://www.google.com/maps/dir/?api=1&destination=${h.lat},${h.lon}`;
@@ -1067,7 +1253,7 @@ function renderStayDots(list, center){
   map.addSource('stay-dots', { type:'geojson', data:{ type:'FeatureCollection',
     features: list.map(h => ({ type:'Feature',
       properties:{ info: `<h3>🏨 ${esc(h.name)}</h3>` +
-        `<div class="t" style="margin-top:6px">${[h.type?esc(h.type):'', `~${h._d.toFixed(1)} km away`, h.addr?esc(h.addr):''].filter(Boolean).join('<br>')}</div>` +
+        `<div class="t" style="margin-top:6px">${[h.type?esc(h.type):'', `~${fmtDist(h._d, 1)} away`, h.addr?esc(h.addr):''].filter(Boolean).join('<br>')}</div>` +
         `<div class="t" style="margin-top:6px"><a href="https://www.google.com/maps/dir/?api=1&destination=${h.lat},${h.lon}" target="_blank" rel="noopener">🧭 Directions in Google Maps ↗</a></div>` },
       geometry:{ type:'Point', coordinates:[h.lon, h.lat] } })) } });
   map.addLayer({ id:'stay-dots', type:'circle', source:'stay-dots',
@@ -1107,7 +1293,7 @@ function showAlternatives(lat, lon){
   // recover the clicked charger's operator (if any) so we can flag same-network options
   const src = (TRIP && TRIP.chargers || []).find(c => Math.abs(c.lat-lat)<1e-5 && Math.abs(c.lon-lon)<1e-5);
   altCenter = { lat, lon, op: src ? (src.operator||'') : '' };
-  altRadiusKm = 10;                                   // fresh open always starts at 10 km
+  altRadiusKm = defaultRadiusKm();                    // fresh open starts at the middle chip
   if (openPopup){ openPopup.remove(); openPopup = null; }
   $('altPage').classList.add('show');
   $('altPage').scrollTop = 0;
@@ -1115,11 +1301,11 @@ function showAlternatives(lat, lon){
 }
 function renderAltToggle(){
   const box = $('altToggle'); box.innerHTML = '';
-  [5,10,20].forEach(km => {
+  radiusChoices().forEach(c => {
     const b = document.createElement('button');
-    b.className = 'alt-chip' + (km===altRadiusKm ? ' on' : '');
-    b.textContent = km + ' km';
-    b.onclick = () => { altRadiusKm = km; renderAlternatives(); };
+    b.className = 'alt-chip' + (Math.abs(c.km - altRadiusKm) < 0.01 ? ' on' : '');
+    b.textContent = c.label;
+    b.onclick = () => { altRadiusKm = c.km; renderAlternatives(); };
     box.appendChild(b);
   });
 }
@@ -1135,15 +1321,15 @@ function renderAlternatives(){
   }
   list.sort((a,b) => a._d - b._d);
   altList = list.slice(0, 80);
-  $('altTitle').textContent = `Charging within ${R} km`;
+  $('altTitle').textContent = `Charging within ${fmtDist(R, 0)}`;
   renderAltToggle();
   if (!altList.length){
-    $('altStatus').textContent = `No other chargers within ${R} km in the loaded data — try a wider radius.`;
+    $('altStatus').textContent = `No other chargers within ${fmtDist(R, 0)} in the loaded data — try a wider radius.`;
     $('altList').innerHTML = '';
     return;
   }
   const fast = altList.filter(c => tierOf(c.kw) >= 1).length;
-  $('altStatus').innerHTML = `<b>${altList.length}</b> charger${altList.length>1?'s':''} within ${R} km · <b>${fast}</b> fast/ultra · press <b>← Back to map</b> to see them on the map. Live availability lives in your charging app — this shows what’s mapped, not real-time status.`;
+  $('altStatus').innerHTML = `<b>${altList.length}</b> charger${altList.length>1?'s':''} within ${fmtDist(R, 0)} · <b>${fast}</b> fast/ultra · press <b>← Back to map</b> to see them on the map. Live availability lives in your charging app — this shows what’s mapped, not real-time status.`;
   $('altList').innerHTML = altList.map(c => altCardHtml(c, op)).join('');
 }
 function altCardHtml(c, srcOp){
@@ -1154,9 +1340,9 @@ function altCardHtml(c, srcOp){
   const sameOp = srcOp && c.operator && c.operator.toLowerCase() === srcOp.toLowerCase();
   const meta = [];
   meta.push(`<span style="color:${tierColor};font-weight:bold">${tierLabel}${c.kw?` · ${esc(c.kw)} kW`:''}</span>`);
-  meta.push(`~${c._d.toFixed(1)} km away`);
+  meta.push(`~${fmtDist(c._d, 1)} away`);
   if (c.operator) meta.push('Operator: ' + esc(c.operator) + (sameOp ? ' <span style="color:#b5471f">· same network</span>' : ''));
-  meta.push(`Charging: ${c.cost ? esc(c.cost) : 'cost not listed'}`);
+  meta.push(`Charging: ${costLabel(c)}`);
   meta.push(apps.length ? `Apps: ${esc(apps.join(', '))}` : `Apps: roaming (${ROAMING_APPS})`);
   const dir = `https://www.google.com/maps/dir/?api=1&destination=${c.lat},${c.lon}`;
   return `<div class="stay-result"><h3>⚡ ${esc(c.name||'Charging station')}</h3>
@@ -1222,7 +1408,7 @@ function chargerHtml(c, stopNo, canAdd){
   if (c.kw) spec.push(`${esc(c.kw)} kW`);
   if (c.points) spec.push(`${esc(c.points)} points`);
   if (spec.length) bits.push(spec.join(' · '));
-  bits.push(`Charging: ${c.cost ? esc(c.cost) : 'cost not listed'}`);
+  bits.push(`Charging: ${costLabel(c)}`);
   if (c.usage) bits.push(esc(c.usage));
   if (c.membership) bits.push('Membership / app may be required');
   const apps = appsFor(`${c.operator||''} ${c.name||''}`);   // operator OR charger name
@@ -1236,20 +1422,25 @@ function chargerHtml(c, stopNo, canAdd){
   const addBtn = (canAdd && hasLoc)
     ? `<button class="popbtn add" onclick="addUserStop(${(+c.lat)},${(+c.lon)})">➕ Add this stop to my route</button>` : '';
   const altBtn = hasLoc
-    ? `<button class="popbtn alt" onclick="showAlternatives(${(+c.lat)},${(+c.lon)})">⚡ This one down? Alternatives within 10 km</button>` : '';
+    ? `<button class="popbtn alt" onclick="showAlternatives(${(+c.lat)},${(+c.lon)})">⚡ This one down? Alternatives within ${fmtDist(defaultRadiusKm(), 0)}</button>` : '';
   const hotelBtn = hasLoc
-    ? `<button class="popbtn hotel" onclick="findAccommodation(${(+c.lat)},${(+c.lon)})">🏨 Accommodation within 3 km</button>` : '';
+    ? `<button class="popbtn hotel" onclick="findAccommodation(${(+c.lat)},${(+c.lon)})">🏨 Accommodation within ${fmtDist(3, 0)}</button>` : '';
   return `<h3>${head}</h3>${sub}<div class="t" style="margin-top:6px">${bits.join('<br>')}</div>
     <div class="t" style="margin-top:6px">Data: Open Charge Map</div>${addBtn}${altBtn}${hotelBtn}`;
 }
 
+let lastTripInfo = null;
 function renderTrip(info){
+  lastTripInfo = info;          // so a units switch can rebuild the panel
   const { pts, routeGeo, result, car, realRoad, distKm, det, drivingH, chargeH,
           ferryMin, ferryName, routeIdx, nDays, maxHours } = info;
   clearMap();
   const { stops, corridor, L, reachedEnd } = result;
   let costTotal = 0;
-  stops.forEach(s => { const free = s.cost && /free/i.test(s.cost); costTotal += free ? 0 : (s.addKWh||0)*EUR_PER_KWH; });
+  // Only a believable free claim contributes nothing - see costOf().
+  stops.forEach(s => { costTotal += costOf(s, s.addKWh); });
+  // If any stop claims free on DC, the total is a floor rather than a guess.
+  const anyUnverifiedFree = stops.some(s => freeClaim(s) && !freeTrusted(s));
   const vig = countriesAlong(routeGeo).filter(c => VIGNETTE[c]);   // vignette countries on the route
 
   // route line (real road geometry when routing succeeded; straight otherwise)
@@ -1318,7 +1509,7 @@ function renderTrip(info){
     html += `<div class="routes">`;
     TRIP.routes.forEach((rt, i) => {
       const ferry = rt.ferryMin > 0 ? ` · ⛴ ${Math.round(rt.ferryMin)}m` : '';
-      const lab = `${Math.round(rt.distKm).toLocaleString()} km · ${fmtDur(rt.durationH)}${ferry}`;
+      const lab = `${fmtDist(rt.distKm, 0)} · ${fmtDur(rt.durationH)}${ferry}`;
       const name = rt.ferryMin > 0 ? '⛴ Via ferry' : (i === 0 ? 'Fastest' : `Alternative ${i}`);
       html += `<button class="rbtn${i===routeIdx?' on':''}" onclick="planOnRoute(${i})">
         <span class="rlab">${name}</span> — ${lab}</button>`;
@@ -1327,8 +1518,8 @@ function renderTrip(info){
   }
 
   html += `<div class="row"><span>Car</span><b>${esc(car.model)}</b></div>
-    <div class="row"><span>Driving distance</span><b>~${drivingKm.toLocaleString()} km</b></div>
-    <div class="row"><span>Your range</span><b>${car.rangeKm} km</b></div>
+    <div class="row"><span>Driving distance</span><b>~${fmtDist(distKm, 0)}</b></div>
+    <div class="row"><span>Your range</span><b>${fmtDist(car.rangeKm, 0)}</b></div>
     <div class="row"><span>Charging stops</span><b>${stops.length}</b></div>
     <div class="row"><span>Driving time</span><b>${fmtDur(drivingH)}</b></div>`;
   if (ferryMin > 0)
@@ -1339,6 +1530,12 @@ function renderTrip(info){
   if (nDays > 1)
     html += `<div class="row"><span>Days (driving)</span><b>${nDays} · ~${maxHours}h/day max</b></div>`;
   html += `<div class="row"><span>Est. charging cost</span><b>~€${Math.round(costTotal)} <span style="color:var(--muted);font-weight:normal">ballpark</span></b></div>`;
+  if (anyUnverifiedFree){
+    html += `<div class="row"><span style="color:#c77d0a;font-size:12px">`
+         +  `A stop on this route is listed as free charging. That is rare on fast `
+         +  `chargers and often out of date, so the estimate assumes you pay.`
+         +  `</span></div>`;
+  }
 
   if (!stops.length && reachedEnd){
     html += `<div class="ok">You can make this trip on a single charge — no stops needed
@@ -1370,10 +1567,9 @@ function renderTrip(info){
         listOpen = true;
       } else if (!listOpen){ html += `<ol class="stops">`; listOpen = true; }
 
-      const km = Math.round(s.pos * det);
+      const legKmIn = s.pos * det;
       const kw = s.kw ? `${s.kw} kW` : 'kW n/a';
-      const cost = s.cost ? esc(s.cost)
-                 : (s.addKWh ? `~€${Math.round(s.addKWh*EUR_PER_KWH)} est` : 'cost not listed');
+      const cost = costLabel(s, s.addKWh);
       const place = s.place ? esc(s.place) : esc(s.name || 'Charging station');
       const chargerName = s.place ? `<br><span style="color:#6a6152">${esc(s.name||'Charging station')}</span>` : '';
       const chg = s.chargeMin ? ` · ~${Math.round(s.chargeMin)} min charge` : '';
@@ -1390,7 +1586,7 @@ function renderTrip(info){
         : '';
       html += `<li><span class="num${s.slow?' slow':''}${s.overnight?' overnight':''}">${i+1}</span>
         <span><span class="stopname">${place}</span>${chargerName}<br>
-        <span class="stopmeta">~${km.toLocaleString()} km in · ${kw} · ${cost}${chg}${s.slow?' · <b style="color:#c77d0a">slow only</b>':''}
+        <span class="stopmeta">~${fmtDist(legKmIn, 0)} in · ${kw} · ${cost}${chg}${s.slow?' · <b style="color:#c77d0a">slow only</b>':''}
         ${opLine}</span>${overnight}</span></li>`;
     });
     if (listOpen) html += `</ol>`;
@@ -1405,6 +1601,62 @@ function renderTrip(info){
 }
 
 $('back').addEventListener('click', () => { $('start').style.display = 'flex'; });
+
+/* Report the running build on screen, so a screenshot or a bug report always
+   identifies the version without asking. */
+window.addEventListener('load', () => {
+  const vt = $('versionTag');
+  if (vt) vt.textContent = "build " + BUILD_VERSION + " \u00b7 charger data " + EV_DATA_VERSION;
+});
+
+/* ---------------- units toggle ----------------
+   Flipping the toggle converts whatever is already in the range box rather
+   than just relabelling it. Someone who types 300 km and then switches to
+   miles means the same car, not a car with 300 miles of range - and that
+   particular misreading is the one that would strand them. */
+function applyUnits(){
+  const u = $('rangeUnit'); if (u) u.textContent = unitLabel();
+  document.querySelectorAll('#unitToggle button').forEach(b =>
+    b.classList.toggle('on', b.dataset.u === UNITS));
+  const box = $('fRange');
+  if (box) box.max = UNITS === 'mi' ? 700 : 1000;
+  // Anything already on screen was formatted in the old unit. clearMap()
+  // guards every removal, so re-rendering the same trip is safe.
+  if (lastTripInfo){ try{ renderTrip(lastTripInfo); }catch(e){} }
+  // A radius chip set in the other system is no longer one of the choices.
+  if (altCenter && $('altPage').classList.contains('show')){
+    altRadiusKm = defaultRadiusKm();
+    try{ renderAlternatives(); }catch(e){}
+  }
+}
+
+function setUnits(next){
+  if (next === UNITS) return;
+  const box = $('fRange');
+  const km = box ? toKm(+box.value || 0) : 0;   // read in the OLD unit first
+  UNITS = next;
+  try{ localStorage.setItem(UNIT_KEY, UNITS); }catch(e){}
+  if (box && km) box.value = Math.round(toDisp(km));
+  applyUnits();
+}
+
+document.querySelectorAll('#unitToggle button').forEach(b =>
+  b.addEventListener('click', () => setUnits(b.dataset.u)));
+
+/* Seeded from locale, so a US or UK phone opens on miles - but it is a visible
+   toggle, so a wrong guess costs one tap and nothing is hidden. */
+(function initUnits(){
+  const box = $('fRange');
+  if (box && UNITS === 'mi') box.value = Math.round(toDisp(+box.value || 0));
+  applyUnits();
+})();
+
+/* Report the running build on screen, so a screenshot or a bug report always
+   identifies the version without asking. */
+window.addEventListener('load', () => {
+  const vt = $('versionTag');
+  if (vt) vt.textContent = "build " + BUILD_VERSION + " \u00b7 charger data " + EV_DATA_VERSION;
+});
 </script>
 </body>
 </html>
