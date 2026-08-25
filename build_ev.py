@@ -60,6 +60,13 @@ COUNTRIES = [
     "EE","LV","LT","ES","PT","GR","SI","HR","MT","CY","PL","CZ","SK","HU","RO","BG",
     "RU","BY","UA","RS","TR","MK","MD","BA","AL","ME","XK",
     "US","CA","MX","AU","NZ",
+    # Added 24 Aug 2026 after an OCM coverage survey (ocm_survey.ps1). Only
+    # countries whose 200-POI sample was capped or close to it, AND that had
+    # real DC coverage. Excluded on the evidence: CN (15 POIs against a real
+    # network of 300,000+ - domestic operators do not publish to OCM),
+    # TH (35), SG (15), PE (9, zero DC), VN (8, 55% unknown connectors),
+    # IN (capped, but 31.8% unknown connector type - filtering unreliable).
+    "JP","KR","MY","ID","BR","UY","CL","AR","CO",
 ]
 
 
@@ -104,7 +111,7 @@ def get_json_retry(url, key=None, timeout=180, attempts=5):
 # ---------------------------------------------------------------------------
 
 def load_reference(key):
-    """id -> title maps for operators and usage types.
+    """id -> title maps for operators, usage types and connection types.
 
     Fetched ONCE per run, not per country. compact=true gives us IDs; these maps
     turn them back into the names the app displays and matches roaming apps on.
@@ -122,21 +129,55 @@ def load_reference(key):
             "membership": bool(u.get("IsMembershipRequired")),
             "payAtLocation": bool(u.get("IsPayAtLocation")),
         }
-    print(f"  {len(ops)} operators, {len(usage)} usage types", flush=True)
-    return ops, usage
+    # Connection types. Needed because a charger your car cannot physically
+    # plug into is worse than no charger: the route looks planned and isn't.
+    # Japan is NACS/CHAdeMO with ZERO CCS2; Korea and Brazil are CCS2; Colombia
+    # has GB/T. ID 0 means "not recorded" and must stay distinguishable from
+    # "recorded as something we don't handle".
+    conns = {c["ID"]: (c.get("Title") or "").strip()
+             for c in ref.get("ConnectionTypes", []) if c.get("ID") is not None}
+    print(f"  {len(ops)} operators, {len(usage)} usage types, "
+          f"{len(conns)} connection types", flush=True)
+    return ops, usage, conns
 
 
 # ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
 
-def parse_charger(poi, ops, usage):
+def connector_family(title):
+    """OCM connection-type title -> the family the app reasons about.
+
+    OCM has ~40 connection types; a driver only cares which of a handful of
+    incompatible families a stall belongs to. Deliberately coarse.
+    """
+    t = (title or "").lower()
+    if not t:
+        return None
+    if "nacs" in t or "supercharger" in t:      return "NACS"
+    if "chademo" in t:                          return "CHADEMO"
+    if "gb/t" in t or "gb-t" in t or "gbt" in t:
+        return "GBT_DC" if "dc" in t else "GBT_AC"
+    if "ccs" in t or "combo" in t:
+        # CCS Type 1 (US/JP bodywork) and Type 2 (EU) are NOT interchangeable.
+        return "CCS1" if ("type 1" in t or "j1772" in t) else "CCS2"
+    if "j1772" in t or "type 1" in t:           return "TYPE1"
+    if "type 2" in t or "mennekes" in t:        return "TYPE2"
+    if "type 3" in t:                           return "TYPE3"
+    if "schuko" in t or "cee" in t or "domestic" in t or "bs 1363" in t:
+        return "DOMESTIC"
+    if "tesla" in t:                            return "TESLA_OTHER"
+    return "OTHER"
+
+
+def parse_charger(poi, ops, usage, conn_names=None):
     """One OCM POI -> the compact record the app consumes.
 
     Handles BOTH shapes: compact mode (OperatorID int) and verbose mode
     (OperatorInfo{} object), so the script keeps working if the output mode is
     ever changed.
     """
+    conn_names = conn_names or {}
     ai = poi.get("AddressInfo") or {}
     lat, lon = ai.get("Latitude"), ai.get("Longitude")
     if lat is None or lon is None:
@@ -145,6 +186,31 @@ def parse_charger(poi, ops, usage):
     conns = poi.get("Connections") or []
     kws = [c.get("PowerKW") for c in conns if c.get("PowerKW")]
     qty = sum((c.get("Quantity") or 0) for c in conns)
+
+    # Connector families present at this site, plus how many connections had no
+    # type recorded. "unknown" is NOT the same as "incompatible" - the app must
+    # be able to say "connector not recorded" rather than wrongly ruling a stop
+    # out. Germany runs ~16% unrecorded, Japan ~1.5%.
+    fams, unknown = [], 0
+    for c in conns:
+        cid = c.get("ConnectionTypeID")
+        title = ""
+        ct = c.get("ConnectionType")
+        if isinstance(ct, dict):
+            title = ct.get("Title") or ""
+        if not title and cid is not None:
+            title = conn_names.get(cid, "")
+        fam = connector_family(title)
+        if fam is None or cid in (0, None):
+            unknown += 1
+        elif fam not in fams:
+            fams.append(fam)
+
+    # CurrentTypeID 30/40 are the DC values in OCM's reference data. Kept as a
+    # fallback signal: even with no connector type, "this is AC only" is a real
+    # warning for a driver expecting a fast stop.
+    has_dc = any((c.get("CurrentTypeID") in (30, 40)) or
+                 ((c.get("PowerKW") or 0) >= 50) for c in conns)
 
     # Operator: prefer the nested object if present, else look the ID up.
     op = ""
@@ -179,7 +245,13 @@ def parse_charger(poi, ops, usage):
         "points": poi.get("NumberOfPoints") or qty or "",
         "cost": (poi.get("UsageCost") or "").strip(),
         "usage": ut_title,
+        # Connector families at this site, e.g. ["CCS2","CHADEMO"]. Empty list
+        # plus connUnknown > 0 means "OCM has connections here but did not say
+        # what they are" - show the stop, flag it as unverified, never hide it.
+        "conn": fams,
     }
+    if unknown:  rec["connUnknown"] = unknown
+    if has_dc:   rec["dc"] = 1
     if membership: rec["membership"] = 1
     if pay_at:     rec["payAtLocation"] = 1
     return rec
@@ -277,7 +349,7 @@ def merge(existing, fresh):
     return list(by_id.values()), added, updated
 
 
-def build_country(cc, key, out_dir, ops, usage, since=None):
+def build_country(cc, key, out_dir, ops, usage, conn_names, since=None):
     cc = cc.lower()
     path = os.path.join(out_dir, f"{cc}.json")
     existing = load_existing(path)
@@ -292,7 +364,7 @@ def build_country(cc, key, out_dir, ops, usage, since=None):
     print(f"  [{cc}] {mode}", flush=True)
 
     pois = fetch_country(cc, key, eff_since)
-    fresh = [c for c in (parse_charger(p, ops, usage) for p in pois) if c]
+    fresh = [c for c in (parse_charger(p, ops, usage, conn_names) for p in pois) if c]
 
     if eff_since and existing:
         chargers, added, updated = merge(existing, fresh)
@@ -381,14 +453,14 @@ def main(argv=None):
         ap.error("give --country XX or --all")
 
     os.makedirs(args.out, exist_ok=True)
-    ops, usage = load_reference(key)
+    ops, usage, conn_names = load_reference(key)
 
     total = ok = failed = 0
     t0 = time.time()
     for i, cc in enumerate(targets, 1):
         print(f"[{i}/{len(targets)}] {cc}", flush=True)
         try:
-            total += build_country(cc, key, args.out, ops, usage, args.since)
+            total += build_country(cc, key, args.out, ops, usage, conn_names, args.since)
             ok += 1
         except KeyboardInterrupt:
             print("\nInterrupted - files already written are kept.")

@@ -188,6 +188,12 @@
       <div id="carSpec" class="note" style="margin-top:4px"></div>
     </div>
     <div class="field">
+      <label>Charging socket on your car</label>
+      <select id="fConn" class="carsel"></select>
+      <div class="note" style="margin-top:4px">Chargers that do not fit are skipped when planning,
+        and marked if you tap them. This matters most outside Europe &mdash; Japan has no CCS Type 2 at all.</div>
+    </div>
+    <div class="field">
       <label>Range on a full charge (<span id="rangeUnit">km</span>)
         <span id="unitToggle" class="unit-toggle">
           <button type="button" data-u="km" class="on">km</button><button type="button" data-u="mi">miles</button>
@@ -269,7 +275,7 @@ const EV_DATA_VERSION = "2026-08-22";
 
 /* Shown in the corner of the start screen and logged to the console. Bump on
    every release, so a running app can always be identified from a screenshot. */
-const BUILD_VERSION = "1.0.2 (2026-08-23)";
+const BUILD_VERSION = "1.0.3 (2026-08-25)";
 console.log("%cEVchargeScout build: " + BUILD_VERSION + " \u00b7 charger data " + EV_DATA_VERSION,
             "font-weight:bold");
 
@@ -371,6 +377,67 @@ const OPERATOR_APPS = {
 };
 const ROAMING_APPS = 'Chargemap, Plugsurfing, Shell Recharge';
 
+/* ------------------------------------------------------------------
+   CONNECTORS
+
+   Every charger used to be assumed usable. Across Europe that is very
+   nearly true - a German sample came back 84% CCS2 and Type 2. It is
+   flatly untrue elsewhere. A Japanese sample had ZERO CCS2: 120 NACS
+   and 80 CHAdeMO. A European car planned through Japan would have been
+   routed stop to stop through sockets it cannot physically enter.
+
+   The rule that matters: UNKNOWN IS NOT INCOMPATIBLE. OCM leaves the
+   connector unrecorded on roughly 16% of German connections. Treating a
+   blank as unusable would delete a sixth of Europe. A blank is shown,
+   planned on, and labelled unverified - never silently dropped.
+   ------------------------------------------------------------------ */
+const CONN_LABEL = {
+  CCS2:'CCS Type 2', CCS1:'CCS Type 1', CHADEMO:'CHAdeMO', NACS:'NACS / Tesla',
+  TYPE2:'Type 2 (AC)', TYPE1:'Type 1 / J1772 (AC)', TYPE3:'Type 3 (AC)',
+  GBT_DC:'GB/T DC', GBT_AC:'GB/T AC', DOMESTIC:'Domestic socket',
+  TESLA_OTHER:'Tesla (other)', OTHER:'Other'
+};
+
+/* What a car can physically use. A CCS2 car also takes Type 2 for AC.
+   Adapters exist for some pairings, but that is the driver's decision to
+   make - not something to assume on their behalf when being wrong means
+   arriving at a stall that does not fit. */
+const CONN_PROFILES = {
+  CCS2:    { label:'CCS Type 2 (Europe)',     conn:['CCS2','TYPE2','DOMESTIC'] },
+  CCS1:    { label:'CCS Type 1 (N. America)', conn:['CCS1','TYPE1','DOMESTIC'] },
+  CHADEMO: { label:'CHAdeMO',                 conn:['CHADEMO','TYPE1','TYPE2','DOMESTIC'] },
+  NACS:    { label:'NACS / Tesla',            conn:['NACS','TESLA_OTHER','CCS2','TYPE2','DOMESTIC'] },
+  GBT:     { label:'GB/T (China)',            conn:['GBT_DC','GBT_AC','DOMESTIC'] }
+};
+
+/* ev-cars.json carries no connector field yet. Until it does, infer it:
+   almost every model in that list is European-market, and Teslas take both. */
+function carProfile(brand){
+  return (brand||'').toLowerCase().includes('tesla') ? 'NACS' : 'CCS2';
+}
+let CAR_CONN = 'CCS2';                       // active profile key
+
+/* A charger's connector families, as written by build_ev.py. */
+function connOf(c){
+  const v = c && c.conn;
+  if (Array.isArray(v)) return v;
+  if (typeof v === 'string' && v) return v.split(',');
+  return [];
+}
+/* usable | unknown | incompatible. Three states, deliberately: collapsing
+   'unknown' into either of the other two is what makes this dangerous. */
+function connState(c){
+  const fams = connOf(c);
+  if (!fams.length) return 'unknown';
+  const mine = (CONN_PROFILES[CAR_CONN] || CONN_PROFILES.CCS2).conn;
+  return fams.some(f => mine.includes(f)) ? 'usable' : 'incompatible';
+}
+function connText(c){
+  const fams = connOf(c);
+  if (!fams.length) return 'Connector not recorded';
+  return fams.map(f => CONN_LABEL[f] || f).join(', ');
+}
+
 // Ballpark fast-DC price for a rough cost estimate (real prices vary a lot by network/country).
 const EUR_PER_KWH = 0.55;
 
@@ -456,8 +523,23 @@ const COUNTRY_BBOX = {
   cy:[34.5,32.2,35.8,34.7], pl:[49.0,14.0,54.9,24.2], cz:[48.5,12.0,51.1,18.9],
   sk:[47.7,16.8,49.7,22.7], hu:[45.7,16.0,48.7,23.0], ro:[43.6,20.2,48.3,29.8],
   bg:[41.2,22.3,44.3,28.7],
+  // Shipped in ev/ since the first build but never listed here, so they were
+  // only ever loaded when they happened to BE the start or the destination.
+  // A country you merely drive through is found only through this table, so
+  // Moscow -> Belgrade never fetched by.json at all.
+  ru:[41.2,19.6,78.0,180.0], by:[51.2,23.1,56.2,32.8], ua:[44.3,22.1,52.4,40.3],
+  rs:[42.2,18.8,46.2,23.0],  tr:[35.8,25.6,42.1,44.8], mk:[40.8,20.4,42.4,23.0],
+  md:[45.4,26.6,48.5,30.2],  ba:[42.5,15.7,45.3,19.6], al:[39.6,19.3,42.7,21.1],
+  me:[41.8,18.4,43.6,20.4],  xk:[41.8,20.0,43.3,21.8],
   us:[24.5,-125.0,49.4,-66.9], ca:[41.7,-141.0,70.0,-52.0], mx:[14.5,-118.5,32.8,-86.6],
-  au:[-43.7,112.9,-10.6,153.7], nz:[-47.4,166.0,-34.3,178.7]
+  au:[-43.7,112.9,-10.6,153.7], nz:[-47.4,166.0,-34.3,178.7],
+  // Added Aug 2026 after an OCM coverage survey. Excluded on the evidence:
+  // CN (15 POIs against a real network of 300,000+), TH (35), SG (15),
+  // PE (9, zero DC), VN (8), IN (32% of connectors unrecorded, so
+  // compatibility filtering could not be trusted there).
+  jp:[24.0,122.9,45.6,154.0], kr:[33.1,125.0,38.6,129.6], my:[0.8,99.6,7.4,119.3],
+  id:[-11.0,95.0,6.1,141.0],  br:[-33.8,-74.0,5.3,-34.8], uy:[-35.0,-58.5,-30.1,-53.1],
+  cl:[-56.0,-75.7,-17.5,-66.4], ar:[-55.1,-73.6,-21.8,-53.6], co:[-4.2,-79.0,13.4,-66.9]
 };
 // Countries whose box overlaps any route segment (padded) — the files we should load.
 function routeCountries(pts){
@@ -557,7 +639,13 @@ function planStops(routeXY, segCum, L, chargers, rangeKm, det, forced){
     if (p.dist <= CORRIDOR) corridor.push(Object.assign({}, c, { pos:p.pos, off:p.dist }));
   }
   corridor.sort((a,b)=> a.pos - b.pos);
-  const fast = corridor.filter(c => c.kw !== '' && c.kw != null && +c.kw >= FAST_KW);
+  // Tag every corridor charger so the map can show an incompatible one as
+  // present-but-unusable, rather than pretending it is not there at all.
+  corridor.forEach(c => { c._cs = connState(c); });
+  // Plan only on what fits. 'unknown' stays in the pool - OCM leaves ~16% of
+  // German connections unrecorded, and dropping those would gut Europe.
+  const fits = corridor.filter(c => c._cs !== 'incompatible');
+  const fast = fits.filter(c => c.kw !== '' && c.kw != null && +c.kw >= FAST_KW);
 
   // User-forced charging stops (clicked on the map) — projected onto THIS route, in order.
   const forcedStops = (forced || []).map(f => {
@@ -576,7 +664,7 @@ function planStops(routeXY, segCum, L, chargers, rangeKm, det, forced){
       const reachF = fast.filter(inSeg);
       let pick = null, slow = false;
       if (reachF.length) pick = reachF[reachF.length-1];
-      else { const reachA = corridor.filter(inSeg); if (reachA.length){ pick = reachA[reachA.length-1]; slow = true; } }
+      else { const reachA = fits.filter(inSeg); if (reachA.length){ pick = reachA[reachA.length-1]; slow = true; } }
       if (!pick){ gaps.push({ fromPos: cur }); break; }
       stops.push(Object.assign({}, pick, { slow }));
       cur = pick.pos;
@@ -972,19 +1060,44 @@ function onCarChange(){
   $('fRange').value = Math.round(toDisp(+o.dataset.range));
   $('manualSpec').style.display = 'none';
   $('carSpec').innerHTML = `<b>${o.dataset.batt} kWh</b> usable · <b>${o.dataset.maxkw} kW</b> max DC · ~${fmtDist(+o.dataset.range, 0)} WLTP`;
+  syncConnector();
+}
+
+/* Seed the socket dropdown from the chosen car, but leave it editable: the
+   same model ships with a different socket in different markets, and the
+   driver can see which one is on their car. Once touched, stop overriding. */
+function syncConnector(){
+  const sel = $('fConn');
+  if (!sel) return;
+  if (!sel.options.length){
+    for (const k of Object.keys(CONN_PROFILES)){
+      const op = document.createElement('option');
+      op.value = k; op.textContent = CONN_PROFILES[k].label;
+      sel.appendChild(op);
+    }
+  }
+  if (!sel.dataset.touched){
+    const o = $('fCar').selectedOptions[0];
+    sel.value = carProfile(o && o.value !== 'custom' ? o.value : '');
+  }
+  CAR_CONN = sel.value;
 }
 // Resolve the car for planning: from the dropdown, or manual fields / an estimate.
 function resolveCar(){
   const o = $('fCar').selectedOptions[0];
   // The box is in whatever the toggle says; the planner is always in km.
   const rangeKm = Math.max(50, toKm(+$('fRange').value || 0));
+  const sel = $('fConn');
+  CAR_CONN = (sel && sel.value) || 'CCS2';
   if (o && o.value !== 'custom')
-    return { model:o.value, batt:+o.dataset.batt, maxkw:+o.dataset.maxkw, rangeKm, known:true };
+    return { model:o.value, batt:+o.dataset.batt, maxkw:+o.dataset.maxkw,
+             rangeKm, known:true, conn:CAR_CONN };
   const batt = +$('fBatt').value || (rangeKm * 0.16);
   const maxkw = +$('fMaxkw').value || 120;
-  return { model:'Custom EV', batt, maxkw, rangeKm, known:false };
+  return { model:'Custom EV', batt, maxkw, rangeKm, known:false, conn:CAR_CONN };
 }
 $('fCar').addEventListener('change', onCarChange);
+$('fConn').addEventListener('change', e => { e.target.dataset.touched = '1'; CAR_CONN = e.target.value; });
 loadCars();
 
 /* ---------------- main: plan a trip ---------------- */
@@ -1409,6 +1522,13 @@ function chargerHtml(c, stopNo, canAdd){
   if (c.points) spec.push(`${esc(c.points)} points`);
   if (spec.length) bits.push(spec.join(' · '));
   bits.push(`Charging: ${costLabel(c)}`);
+  const cs = connState(c);
+  if (cs === 'incompatible')
+    bits.push(`<span style="color:#8a2e1c;font-weight:bold">✖ ${esc(connText(c))} — does not fit your car</span>`);
+  else if (cs === 'unknown')
+    bits.push(`<span style="color:#c77d0a">Connector not recorded — check before you rely on it</span>`);
+  else
+    bits.push(`Connector: ${esc(connText(c))}`);
   if (c.usage) bits.push(esc(c.usage));
   if (c.membership) bits.push('Membership / app may be required');
   const apps = appsFor(`${c.operator||''} ${c.name||''}`);   // operator OR charger name
@@ -1535,6 +1655,16 @@ function renderTrip(info){
          +  `A stop on this route is listed as free charging. That is rare on fast `
          +  `chargers and often out of date, so the estimate assumes you pay.`
          +  `</span></div>`;
+  }
+
+  // If a large share of what is along this route does not fit, say so. A
+  // driver seeing few stops in Japan deserves to know it is the socket and
+  // not the country, and that changing the setting changes the answer.
+  const nBad = corridor.filter(c => c._cs === 'incompatible').length;
+  if (nBad && corridor.length && nBad / corridor.length > 0.25){
+    html += `<div class="warn">🔌 <b>${nBad} of ${corridor.length}</b> chargers along this route
+      use a socket your car does not have (${esc((CONN_PROFILES[CAR_CONN]||CONN_PROFILES.CCS2).label)}),
+      so they were skipped. If that is wrong, change <b>Charging socket on your car</b> and plan again.</div>`;
   }
 
   if (!stops.length && reachedEnd){
