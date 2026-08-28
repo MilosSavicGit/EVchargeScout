@@ -51,8 +51,15 @@ OCM_REF = "https://api.openchargemap.io/v3/referencedata/"
 UA = "EVchargeScout/1.0 (+https://milossavicgit.github.io/EVchargeScout/; contact@bymilossavic.com)"
 
 PAGE_SIZE = 5000          # per request; OCM pages fine at this size
+# Counts a truncated/capped response tends to come back with. Not an error
+# on its own - a real country can end on a round number - but worth saying.
+SUSPICIOUS_PAGE_SIZES = {100, 200, 250, 500, 1000, 2000}
+# A full rebuild that returns less than this share of what we already have
+# is treated as a failed fetch, not as real data. Override with --force.
+MIN_KEEP_RATIO = 0.80
 SLEEP_BETWEEN_PAGES = 2.0
 SLEEP_BETWEEN_COUNTRIES = 5.0
+FORCE = False
 
 # Matches build_ev_all.bat. Order is roughly by expected coverage.
 COUNTRIES = [
@@ -298,8 +305,15 @@ def fetch_country(cc, key, since=None):
         last_id = new_last
         print(f"      page {page}: {len(batch)} (id<={last_id})", flush=True)
 
-        if len(batch) < PAGE_SIZE:
-            break                       # short page = last page
+        # A short page USED to end the loop here. It cannot any more.
+        # If OCM truncates or rate-limits a response, a short page is
+        # indistinguishable from a genuine last page, and the country is
+        # silently written 90% empty. PL was built with exactly 500 records
+        # that way. We now always ask once more and stop only on an empty
+        # response or no forward progress. Costs one extra request per country.
+        if len(batch) < PAGE_SIZE and len(batch) in SUSPICIOUS_PAGE_SIZES:
+            print(f"      note: page of exactly {len(batch)} looks like a server-side "
+                  f"cap, not a last page - continuing", flush=True)
         time.sleep(SLEEP_BETWEEN_PAGES)
     return out
 
@@ -372,6 +386,20 @@ def build_country(cc, key, out_dir, ops, usage, conn_names, since=None):
     else:
         chargers, note = fresh, f"{len(fresh)} total"
 
+    # Countries do not lose most of their chargers overnight. If a FULL rebuild
+    # comes back far smaller than what is on disk, the fetch failed - keep the
+    # existing file rather than overwriting good data with a partial pull.
+    if not eff_since and existing:
+        had = len(existing.get("chargers", []))
+        if had and len(chargers) < had * MIN_KEEP_RATIO:
+            pct = 100.0 * len(chargers) / had
+            msg = (f"{cc}: fetch returned {len(chargers):,} vs {had:,} on disk "
+                   f"({pct:.0f}%) - refusing to overwrite. Re-run when OCM is "
+                   f"healthy, or pass --force if the drop is real.")
+            if not FORCE:
+                raise RuntimeError(msg)
+            print(f"      WARNING (--force): {msg}", flush=True)
+
     save_json_atomic(path, {
         "area": cc,
         "source": "Open Charge Map",
@@ -440,7 +468,13 @@ def main(argv=None):
     ap.add_argument("--out", default="ev", help="output folder (default: ev)")
     ap.add_argument("--index", default="index.html", help="index.html to bump EV_DATA_VERSION in")
     ap.add_argument("--no-bump", action="store_true", help="do not touch index.html")
+    ap.add_argument("--force", action="store_true",
+                    help="write even if a full rebuild is much smaller than the "
+                         "existing file (use only when the drop is genuinely real)")
     args = ap.parse_args(argv)
+
+    global FORCE
+    FORCE = args.force
 
     key = os.environ.get("OCM_API_KEY", "")
     if not key:

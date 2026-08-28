@@ -1,0 +1,1410 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<title>EVchargeScout — plan your EV charging stops</title>
+<meta name="description" content="EVchargeScout plans your EV road-trip charging stops. Enter your route and your car's range; it traces the real road route (ferries included) and picks fast-charger stops, with driving, charging and total time. Part of the ScoutPlatform family." />
+<meta property="og:title" content="EVchargeScout — EV road-trip charging planner" />
+<meta property="og:description" content="Tell it where you're driving and how far your car goes — it plans the charging stops. Ferries, superchargers, multi-day overnight splits. Keyless, open data." />
+<meta property="og:type" content="website" />
+
+<!-- Same static, no-build recipe as the other Scouts. Charger data is prepared per
+     country into ev/<cc>.json by build_ev.py (Open Charge Map). The only runtime call
+     is a light Nominatim geocode of the places you type — everything else is local. -->
+<link href="https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+<script src="https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+
+<style>
+  :root{
+    --ink:#1c1a17; --paper:#f4efe6; --panel:#fffdf8; --rule:#d8cfbe;
+    --accent:#0a7d4d;      /* electric green */
+    --accent2:#b5471f; --muted:#8a7f6d;
+    --fast:#0a7d4d; --slow:#c77d0a; --route:#1d6fe0;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;font-family:Georgia,"Times New Roman",serif;color:var(--ink);background:var(--paper);
+    -webkit-text-size-adjust:100%;text-size-adjust:100%;overflow-x:hidden}
+  button,input,select{font-family:inherit}
+
+  .app{display:grid;grid-template-columns:360px 1fr;height:100dvh}
+  .panel{background:var(--panel);border-right:1px solid var(--rule);padding:16px;overflow-y:auto;min-height:0}
+  #map{width:100%;height:100%;min-height:0}
+  @media(max-width:820px){
+    .app{grid-template-columns:1fr;grid-template-rows:auto minmax(0,1fr)}
+    .panel{max-height:46dvh;border-right:none;border-bottom:1px solid var(--rule)}
+    /* 16px inputs stop iOS Safari zooming in (which made the windows look too big) */
+    .field input, .carsel{font-size:16px}
+  }
+  @media(max-width:480px){
+    #start{padding:14px} .brand{font-size:28px}
+    .panel{padding:12px}                 /* ~5mm narrower content on iPhone */
+    .card{padding:10px}
+  }
+  /* long place names / operators must wrap, never push the layout wider than the screen */
+  .note,.foot,.stopmeta,.stopname,.row,.acitem,.warn{overflow-wrap:anywhere;word-break:break-word}
+
+  /* place-search suggestions dropdown */
+  .field{position:relative}
+  .acbox{position:absolute;left:0;right:0;top:100%;z-index:40;background:#fff;border:1px solid var(--rule);
+    border-radius:10px;box-shadow:0 8px 20px rgba(0,0,0,.18);max-height:240px;overflow-y:auto;margin-top:3px}
+  .acitem{padding:10px 12px;font-size:13px;line-height:1.3;cursor:pointer;border-bottom:1px solid #f1ede3}
+  .acitem:last-child{border-bottom:none}
+  .acitem:active,.acitem:hover{background:#eaf6ef}
+
+  h1{margin:0 0 2px;font-size:21px}
+  .sub{color:var(--muted);font-style:italic;font-size:12px;margin-bottom:12px}
+  .field{margin:8px 0}
+  .field label{display:block;font-size:12px;color:var(--muted);margin-bottom:3px;letter-spacing:.02em}
+  /* 16px, always: iOS Safari auto-zooms into any focused control under 16px and does NOT
+     zoom back out — that stuck zoom was the "window too big" on iPhone. Keep every control ≥16px. */
+  .field input{width:100%;border:1px solid var(--rule);border-radius:10px;padding:10px 12px;font-size:16px;background:#fff;color:var(--ink)}
+  .field input:focus{outline:none;border-color:var(--accent)}
+  .carsel{width:100%;border:1px solid var(--rule);border-radius:10px;padding:10px 12px;font-size:16px;background:#fff;color:var(--ink);font-family:inherit}
+  .carsel:focus{outline:none;border-color:var(--accent)}
+  .wprow{display:flex;gap:6px;align-items:center}
+  .wprow input{flex:1}
+  .wprow button{border:1px solid var(--rule);background:#fff;border-radius:8px;width:34px;height:38px;cursor:pointer;font-size:16px;color:var(--muted)}
+  .wprow button:hover{border-color:var(--accent2);color:var(--accent2)}
+  .addstop{appearance:none;width:100%;border:1.5px solid var(--accent);background:#eaf6ef;border-radius:10px;
+    padding:11px;font-size:14px;font-weight:bold;color:var(--accent);cursor:pointer;margin-top:6px}
+  .addstop:hover{background:#dcefe4}
+  .addstop:active{transform:translateY(1px)}
+  .rangewrap{display:flex;gap:8px}
+  .rangewrap input{flex:1}
+  .plan{width:100%;appearance:none;border:none;border-radius:12px;background:var(--accent);color:#fff;font-size:16px;padding:13px;cursor:pointer;margin-top:12px}
+  .plan:hover{background:#086b41}.plan:disabled{opacity:.6;cursor:default}
+  .note{font-size:12px;color:var(--muted);line-height:1.5;margin-top:8px}
+
+  .card{background:#fff;border:1px solid var(--rule);border-radius:12px;padding:12px;margin:12px 0}
+  .card h2{margin:0 0 8px;font-size:15px}
+  .row{display:flex;justify-content:space-between;font-size:13px;padding:3px 0}
+  .stops{list-style:none;margin:8px 0 0;padding:0}
+  .stops li{display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-top:1px solid var(--rule)}
+  .stops li:first-child{border-top:none}
+  .num{flex:none;width:24px;height:24px;border-radius:50%;background:var(--fast);color:#fff;font-size:12px;
+       font-weight:bold;display:flex;align-items:center;justify-content:center;margin-top:1px}
+  .num.slow{background:var(--slow)}
+  .stopmeta{font-size:12px;color:var(--muted);line-height:1.4}
+  .stopname{font-size:13px;color:var(--ink)}
+  .warn{background:#fdecea;border:1px solid #e0a89d;border-radius:10px;padding:10px;font-size:12px;color:#8a2e1c;margin-top:10px;line-height:1.45}
+  .routes{display:flex;flex-direction:column;gap:6px;margin:10px 0}
+  .rbtn{appearance:none;text-align:left;border:1px solid var(--rule);background:#fff;border-radius:10px;
+    padding:9px 11px;font-size:12.5px;font-family:inherit;color:var(--ink);cursor:pointer}
+  .rbtn:hover{border-color:var(--accent)}
+  .rbtn.on{border-color:var(--accent);background:#eaf6ef;font-weight:bold}
+  .rbtn .rlab{color:var(--accent);font-weight:bold}
+  .dayhdr{font-weight:bold;font-size:14px;color:var(--accent);margin:14px 0 6px;
+    border-bottom:2px solid var(--accent);padding-bottom:4px}
+  .overnight-tag{background:#eef0fb;border:1px solid #b7bde6;border-radius:8px;padding:6px 9px;
+    margin-top:6px;font-size:12px;color:#3b3f8f;line-height:1.4}
+  .num.overnight{background:#3b3f8f}
+  .ok{background:#eaf6ef;border:1px solid #a6d3ba;border-radius:10px;padding:10px;font-size:12px;color:#0a5d38;margin-top:10px;line-height:1.45}
+  .backbtn{appearance:none;border:1px solid var(--rule);background:#fff;color:var(--ink);border-radius:999px;
+           padding:5px 12px;font-size:12px;cursor:pointer;margin-bottom:10px}
+  .backbtn:hover{border-color:var(--accent);color:var(--accent)}
+
+  .maplibregl-popup-content{font-family:Georgia,serif;font-size:13px;max-width:260px}
+  .maplibregl-popup-content h3{margin:0 0 6px;font-size:14px}
+  .maplibregl-popup-content .t{color:var(--muted);font-size:12px;line-height:1.5}
+  .stopmark{background:var(--fast);color:#fff;font-family:Georgia,serif;font-size:12px;font-weight:bold;
+    width:22px;height:22px;border-radius:50%;border:2px solid #fff;display:flex;align-items:center;justify-content:center;
+    box-shadow:0 1px 3px rgba(0,0,0,.4);cursor:pointer}
+  .stopmark.slow{background:var(--slow)}
+  .hotelmark{background:var(--accent2);color:#fff;font-size:12px;width:22px;height:22px;border-radius:50%;
+    border:2px solid #fff;display:flex;align-items:center;justify-content:center;box-shadow:0 1px 3px rgba(0,0,0,.4);cursor:pointer}
+  .popbtn{margin-top:8px;width:100%;appearance:none;border:none;border-radius:8px;padding:9px;
+    font-family:inherit;font-size:13px;font-weight:bold;cursor:pointer}
+  .popbtn.add{background:var(--accent);color:#fff}
+  .popbtn.hotel{background:#fff;color:var(--accent2);border:1.5px solid var(--accent2)}
+  .popbtn.alt{background:#fff;color:var(--accent);border:1.5px solid var(--accent)}
+  .endmark{background:#1c1a17;color:#fff;font-family:Georgia,serif;font-size:11px;font-weight:bold;
+    padding:2px 7px;border-radius:8px;border:2px solid #fff;box-shadow:0 1px 3px rgba(0,0,0,.4)}
+  /* miniature lightning badges for "alternatives within X km" — white so they pop off the
+     green map; the ring colour encodes power tier */
+  .altmark{width:21px;height:21px;border-radius:50%;background:#fff;display:flex;align-items:center;justify-content:center;
+    font-size:12px;line-height:1;border:2.5px solid #7bbf9c;box-shadow:0 1px 3px rgba(0,0,0,.5);cursor:pointer}
+  .altmark.t0{border-color:#3a8f63}
+  .altmark.t1{border-color:#0a5d2e}
+  .altmark.t2{border-color:#111111}
+
+  #start{position:fixed;inset:0;z-index:20;background:var(--paper);overflow-y:auto;display:flex;align-items:center;justify-content:center;padding:22px}
+  .start-inner{width:100%;max-width:440px}
+  .brand{font-size:32px;margin:0 0 2px}
+  .foot{font-size:11px;color:var(--muted);line-height:1.5;margin-top:16px;border-top:1px solid var(--rule);padding-top:12px}
+  .foot a{color:var(--accent2)}
+  .busy{font-size:12px;color:var(--muted);min-height:16px;margin-top:6px}
+
+  /* accommodation overlay — opens as its own full-screen "window" over the map */
+  .stay-page{position:fixed;inset:0;z-index:60;background:var(--paper);overflow-y:auto;display:none}
+  .stay-page.show{display:block}
+  .stay-header{position:sticky;top:0;background:var(--panel);border-bottom:1px solid var(--rule);
+    display:flex;align-items:center;gap:12px;padding:12px 14px;z-index:2}
+  .stay-back{appearance:none;border:1px solid var(--rule);background:#fff;color:var(--ink);
+    border-radius:999px;padding:9px 15px;font-family:inherit;font-size:15px;font-weight:bold;cursor:pointer;white-space:nowrap}
+  .stay-back:hover{border-color:var(--accent);color:var(--accent)}
+  .stay-title{font-size:15px;font-weight:bold;overflow-wrap:anywhere;line-height:1.3}
+  .stay-status{padding:12px 16px;color:var(--muted);font-size:13px;line-height:1.5}
+  .stay-list{max-width:640px;margin:0 auto;padding:0 14px 28px}
+  .stay-result{background:#fff;border:1px solid var(--rule);border-radius:14px;padding:13px;margin:10px 0}
+  .stay-result h3{margin:0 0 4px;font-size:15px;overflow-wrap:anywhere}
+  .stay-result .t{color:var(--muted);font-size:12.5px;line-height:1.5;overflow-wrap:anywhere}
+  .stay-dir{display:inline-block;margin-top:9px;font-size:14px;font-weight:bold;color:var(--accent2);text-decoration:none}
+  .stay-dir:hover{text-decoration:underline}
+  /* radius toggle chips on the "alternatives nearby" overlay */
+  .alt-toggle{display:flex;gap:8px;max-width:640px;margin:0 auto;padding:10px 14px 0}
+  .alt-chip{appearance:none;border:1px solid var(--rule);background:#fff;color:var(--ink);border-radius:999px;
+    padding:8px 15px;font-family:inherit;font-size:15px;cursor:pointer}
+  .alt-chip.on{border-color:var(--accent);background:#eaf6ef;color:var(--accent);font-weight:bold}
+</style>
+</head>
+<body>
+
+<!-- ============ START / PLAN SCREEN ============ -->
+<div id="start">
+  <div class="start-inner">
+    <h1 class="brand">EVchargeScout</h1>
+    <p class="sub">Tell it where you're driving and how far your car goes — it plans the charging stops.</p>
+
+    <div class="field">
+      <label>Start</label>
+      <input id="fStart" placeholder="e.g. Copenhagen" autocomplete="off">
+    </div>
+    <div id="stops"></div>
+    <button class="addstop" id="addStop">＋ Add a stop along the way</button>
+    <div class="field" style="margin-top:10px">
+      <label>Destination</label>
+      <input id="fEnd" placeholder="e.g. Belgrade" autocomplete="off">
+    </div>
+    <div class="field">
+      <label>Car model (pulls battery, range &amp; charge rate)</label>
+      <select id="fCar" class="carsel"></select>
+      <div id="carSpec" class="note" style="margin-top:4px"></div>
+    </div>
+    <div class="field">
+      <label>Range on a full charge (km)</label>
+      <input id="fRange" type="number" min="50" max="1000" step="10" value="475">
+    </div>
+    <div class="field" id="manualSpec" style="display:none">
+      <label>Battery (usable kWh) &amp; max DC (kW) — for the charging-time estimate</label>
+      <div class="rangewrap">
+        <input id="fBatt" type="number" min="10" max="250" step="1" placeholder="battery kWh">
+        <input id="fMaxkw" type="number" min="10" max="400" step="5" placeholder="max kW">
+      </div>
+    </div>
+    <div class="field">
+      <label>Max driving per day (hours) — optional, splits long trips into overnight legs</label>
+      <input id="fMaxDay" type="number" min="2" max="24" step="0.5" placeholder="e.g. 8 — leave blank for one push">
+    </div>
+
+    <button class="plan" id="planBtn">⚡ Plan my charging stops</button>
+    <p class="busy" id="busy"></p>
+
+    <p class="foot">
+      Chargers from <a href="https://openchargemap.org" target="_blank" rel="noopener">Open Charge Map</a>;
+      places resolved via <a href="https://www.openstreetmap.org" target="_blank" rel="noopener">OpenStreetMap</a>.
+      Best coverage across Europe, North America and Australia. Distances are a
+      <b>planning estimate</b> along your route, not exact road distance —
+      always keep a buffer and check chargers before you rely on them.
+    </p>
+  </div>
+</div>
+
+<!-- ============ MAP + RESULTS ============ -->
+<div class="app">
+  <div class="panel">
+    <button class="backbtn" id="back">← New trip</button>
+    <div id="summary"></div>
+  </div>
+  <div id="map"></div>
+</div>
+
+<!-- ============ ACCOMMODATION (Stay Nearby) OVERLAY ============ -->
+<div id="stayPage" class="stay-page">
+  <div class="stay-header">
+    <button class="stay-back" id="stayBack">← Back to map</button>
+    <div class="stay-title" id="stayTitle">Accommodation nearby</div>
+  </div>
+  <div class="stay-status" id="stayStatus"></div>
+  <div id="stayList" class="stay-list"></div>
+</div>
+
+<!-- ============ NEARBY CHARGING ALTERNATIVES OVERLAY ============ -->
+<div id="altPage" class="stay-page">
+  <div class="stay-header">
+    <button class="stay-back" id="altBack">← Back to map</button>
+    <div class="stay-title" id="altTitle">Charging nearby</div>
+  </div>
+  <div class="alt-toggle" id="altToggle"></div>
+  <div class="stay-status" id="altStatus"></div>
+  <div id="altList" class="stay-list"></div>
+</div>
+
+<script>
+/* ===================================================================
+   EVchargeScout — static EV road-trip charging planner.
+   Reuses the ScoutPlatform recipe: MapLibre + OSM tiles, no API keys,
+   prepared ev/<cc>.json charger files from build_ev.py (Open Charge Map).
+   =================================================================== */
+
+const $ = id => document.getElementById(id);
+
+/* Planning constants (see the ParkingScout roadmap for rationale). */
+const SAFETY   = 0.80;   // use 80% of stated range — real range drops with cold/hills/speed
+const DETOUR   = 1.25;   // roads aren't straight: inflate along-route distance to ~driving distance
+const CORRIDOR = 8;      // km each side of the route a charger must be within to count
+const FAST_KW  = 75;     // DC "supercharging" threshold — fast stop / large dark-green dot
+const ULTRA_KW = 300;    // ultra-rapid threshold — black dot
+
+/* Routing engine. OpenRouteService (ferry-aware) is used when a key is set here; otherwise
+   OSRM (works everywhere but skips ferries). The keyless Valhalla server blocks browser
+   requests (CORS), so it can't be used from a static page.
+   KEYLESS by default: uses the free community Valhalla server (ferry-aware). Long multi-stop
+   trips are routed leg-by-leg so each request stays within the free server's limits.
+   Optional: paste an OpenRouteService key here to force ORS instead (handles very long single
+   legs in one shot). Leave "" for the public / testing build. */
+const ORS_KEY = "";
+
+// Sister app for finding a bed at an overnight stop. Adjust if HotelScout's URL differs.
+const HOTELSCOUT_URL = "https://milossavicgit.github.io/HotelScout/";
+
+/* Map charger operators to their own app. Matched by substring of the operator name.
+   Most networks also accept cross-network "roaming" apps, appended separately. */
+const OPERATOR_APPS = {
+  'ionity':['Ionity'], 'tesla':['Tesla'], 'fastned':['Fastned'], 'enbw':['EnBW mobility+'],
+  'allego':['Allego','Smoov'], 'shell':['Shell Recharge'], 'enel':['Enel X Way'],
+  'be charge':['Be Charge'], 'ewiva':['Ewiva'], 'a2a':['A2A E-moving'], 'atlante':['Atlante'],
+  'vattenfall':['InCharge'], 'virta':['Virta'], 'e.on':['E.ON Drive'], 'eon':['E.ON Drive'],
+  'total':['TotalEnergies'], 'chargepoint':['ChargePoint'], 'pod point':['Pod Point'],
+  'gridserve':['GRIDSERVE'], 'osprey':['Osprey'], 'instavolt':['InstaVolt'], 'bp pulse':['bp pulse'],
+  'mer':['Mer'], 'clever':['Clever'], 'eviny':['Eviny'], 'circle k':['Circle K'],
+  'powerdot':['Power Dot'], 'power dot':['Power Dot'], 'greenway':['GreenWay'], 'evbox':['EVBox'],
+  'repsol':['Repsol Waylet'], 'iberdrola':['Iberdrola'], 'endesa':['Endesa X Way'],
+  'fortum':['Fortum'], 'recharge':['Recharge'], 'duferco':['Duferco energia']
+};
+const ROAMING_APPS = 'Chargemap, Plugsurfing, Shell Recharge';
+
+// Ballpark fast-DC price for a rough cost estimate (real prices vary a lot by network/country).
+const EUR_PER_KWH = 0.55;
+
+// Countries that require a vignette / e-toll sticker — with their OFFICIAL online shops.
+const VIGNETTE = {
+  at:{ name:'Austria',     url:'https://www.asfinag.at/en/' },
+  ch:{ name:'Switzerland', url:'https://via.admin.ch/' },
+  cz:{ name:'Czechia',     url:'https://www.edalnice.cz/en/' },
+  sk:{ name:'Slovakia',    url:'https://www.eznamka.sk/en/' },
+  si:{ name:'Slovenia',    url:'https://evinjeta.dars.si/en/' },
+  hu:{ name:'Hungary',     url:'https://ematrica.nemzetiutdij.hu/' },
+  ro:{ name:'Romania',     url:'https://www.erovinieta.ro/' },
+  bg:{ name:'Bulgaria',    url:'https://bgtoll.bg/en/' }
+};
+function appsFor(operator){
+  if (!operator) return [];
+  const s = operator.toLowerCase(), out = [];
+  for (const k in OPERATOR_APPS) if (s.includes(k)) out.push(...OPERATOR_APPS[k]);
+  return [...new Set(out)];
+}
+
+/* Rough bounding boxes [minlat,minlon,maxlat,maxlon] for the covered countries, so we
+   can load every ev/<cc>.json a route passes through — including transit countries the
+   endpoints don't name (a Denmark→Italy trip must pull Germany + Austria too). No extra
+   network calls: purely geometric against the route. */
+const COUNTRY_BBOX = {
+  it:[36.6,6.6,47.1,18.6], fr:[41.3,-5.2,51.1,9.6], de:[47.2,5.8,55.1,15.1],
+  nl:[50.7,3.3,53.6,7.3], be:[49.5,2.5,51.6,6.5], lu:[49.4,5.7,50.2,6.6],
+  at:[46.3,9.5,49.1,17.2], ch:[45.8,5.9,47.9,10.6], gb:[49.9,-8.7,58.8,1.8],
+  ie:[51.4,-10.6,55.5,-5.9], dk:[54.5,8.0,57.9,15.3], se:[55.3,10.9,69.1,24.2],
+  no:[57.9,4.5,71.3,31.2], fi:[59.7,19.4,70.2,31.7], is:[63.2,-24.6,66.6,-13.4],
+  ee:[57.5,21.7,59.8,28.3], lv:[55.6,20.8,58.1,28.3], lt:[53.8,20.9,56.5,27.0],
+  es:[36.0,-9.4,43.9,3.4], pt:[36.9,-9.6,42.2,-6.1], gr:[34.8,19.3,41.8,28.4],
+  si:[45.4,13.3,46.9,16.7], hr:[42.3,13.4,46.6,19.5], mt:[35.7,14.1,36.1,14.6],
+  cy:[34.5,32.2,35.8,34.7], pl:[49.0,14.0,54.9,24.2], cz:[48.5,12.0,51.1,18.9],
+  sk:[47.7,16.8,49.7,22.7], hu:[45.7,16.0,48.7,23.0], ro:[43.6,20.2,48.3,29.8],
+  bg:[41.2,22.3,44.3,28.7],
+  us:[24.5,-125.0,49.4,-66.9], ca:[41.7,-141.0,70.0,-52.0], mx:[14.5,-118.5,32.8,-86.6],
+  au:[-43.7,112.9,-10.6,153.7], nz:[-47.4,166.0,-34.3,178.7]
+};
+// Countries whose box overlaps any route segment (padded) — the files we should load.
+function routeCountries(pts){
+  const pad = 0.4, ccs = new Set();
+  for (let i=0;i<pts.length-1;i++){
+    const a=pts[i], b=pts[i+1];
+    const s0=Math.min(a.lat,b.lat)-pad, s1=Math.min(a.lon,b.lon)-pad,
+          s2=Math.max(a.lat,b.lat)+pad, s3=Math.max(a.lon,b.lon)+pad;
+    for (const cc in COUNTRY_BBOX){
+      const bb = COUNTRY_BBOX[cc];
+      if (!(bb[2]<s0 || bb[0]>s2 || bb[3]<s1 || bb[1]>s3)) ccs.add(cc);
+    }
+  }
+  return [...ccs];
+}
+// Countries a traced route actually passes through — sample its points against the boxes.
+function countriesAlong(geo){
+  const ccs = new Set(), step = Math.max(1, Math.floor(geo.length/150));
+  for (let i=0;i<geo.length;i+=step){
+    const p = geo[i];
+    for (const cc in COUNTRY_BBOX){ const bb = COUNTRY_BBOX[cc];
+      if (p.lat>=bb[0] && p.lat<=bb[2] && p.lon>=bb[1] && p.lon<=bb[3]) ccs.add(cc); }
+  }
+  return [...ccs];
+}
+// Cap a long route geometry to ~N points for the corridor math (drawing uses the full line).
+function downsample(arr, cap){
+  if (arr.length <= cap) return arr;
+  const stride = Math.ceil(arr.length / cap), out = [];
+  for (let i=0;i<arr.length;i+=stride) out.push(arr[i]);
+  if (out[out.length-1] !== arr[arr.length-1]) out.push(arr[arr.length-1]);
+  return out;
+}
+
+if (typeof maplibregl === 'undefined'){
+  $('busy').textContent = 'Couldn’t load the map library — check your connection and reload.';
+  $('planBtn').disabled = true;
+  throw new Error('maplibre-gl failed to load');
+}
+
+/* ---------------- map ---------------- */
+const map = new maplibregl.Map({
+  container:'map',
+  style:{ version:8,
+    sources:{ osm:{ type:'raster', tiles:['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+      tileSize:256, attribution:'© OpenStreetMap contributors' } },
+    layers:[{ id:'osm', type:'raster', source:'osm' }] },
+  center:[10,48], zoom:4
+});
+map.addControl(new maplibregl.NavigationControl(), 'top-right');
+
+// Tap an empty part of the map → offer to show all chargers within 10 km of that point.
+// (Taps that land on a charger/stay/alt dot are left to those layers' own handlers.)
+map.on('click', (e) => {
+  const layers = ['corridor-slow','corridor-fast','corridor-ultra','stay-dots'].filter(l => map.getLayer(l));
+  if (layers.length && map.queryRenderedFeatures(e.point, { layers }).length) return;   // hit a dot
+  if (!TRIP || !(TRIP.chargers && TRIP.chargers.length)) return;                          // no data loaded yet
+  const { lat, lng } = e.lngLat;
+  showPopup(e.lngLat,
+    `<div class="t">Look for charging around this spot?</div>
+     <button class="popbtn alt" onclick="showAlternatives(${lat},${lng})">⚡ Show chargers within 10 km</button>`);
+});
+
+let stopMarkers = [], endMarkers = [];
+
+/* ---------------- geometry (local equirectangular km) ---------------- */
+let LAT0=0, LON0=0, COS0=1;
+function setOrigin(lat,lon){ LAT0=lat; LON0=lon; COS0=Math.cos(lat*Math.PI/180); }
+function toXY(lat,lon){ return [ (lon-LON0)*COS0*111.32, (lat-LAT0)*110.574 ]; }
+function hypot(dx,dy){ return Math.sqrt(dx*dx+dy*dy); }
+
+// Closest point of a polyline to xy → {dist (km off-route), pos (km along route)}.
+function projectToRoute(xy, routeXY, segCum){
+  let best = { dist:Infinity, pos:0 };
+  for (let i=0;i<routeXY.length-1;i++){
+    const a=routeXY[i], b=routeXY[i+1];
+    const dx=b[0]-a[0], dy=b[1]-a[1];
+    const len2 = dx*dx+dy*dy || 1e-9;
+    let t = ((xy[0]-a[0])*dx + (xy[1]-a[1])*dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    const px=a[0]+t*dx, py=a[1]+t*dy;
+    const d = hypot(xy[0]-px, xy[1]-py);
+    if (d < best.dist) best = { dist:d, pos: segCum[i] + t*hypot(dx,dy) };
+  }
+  return best;
+}
+
+/* ---------------- the stop planner ----------------
+   Greedy "farthest reachable" from the start, preferring fast DC.
+   Positions are straight along-route km; multiply by DETOUR for driving km. */
+function planStops(routeXY, segCum, L, chargers, rangeKm, det, forced){
+  const SAFE = rangeKm * SAFETY;
+
+  const corridor = [];
+  for (const c of chargers){
+    const p = projectToRoute(c._xy, routeXY, segCum);
+    if (p.dist <= CORRIDOR) corridor.push(Object.assign({}, c, { pos:p.pos, off:p.dist }));
+  }
+  corridor.sort((a,b)=> a.pos - b.pos);
+  const fast = corridor.filter(c => c.kw !== '' && c.kw != null && +c.kw >= FAST_KW);
+
+  // User-forced charging stops (clicked on the map) — projected onto THIS route, in order.
+  const forcedStops = (forced || []).map(f => {
+    const p = projectToRoute(toXY(f.lat, f.lon), routeXY, segCum);
+    return Object.assign({}, f, { pos:p.pos, off:p.dist, forced:true });
+  }).sort((a,b)=> a.pos - b.pos);
+
+  // Walk the route hitting each forced stop in turn (then the destination), filling any leg
+  // that's longer than the safe range with greedy fast-charger stops in between.
+  const stops = [], gaps = [];
+  let cur = 0, guard = 0;
+  const targets = forcedStops.map(f => ({ pos:f.pos, stop:f })).concat([{ pos:L, stop:null }]);
+  for (const tgt of targets){
+    while ((tgt.pos - cur) * det > SAFE){
+      const inSeg = c => c.pos > cur + 0.01 && c.pos < tgt.pos - 0.01 && (c.pos - cur)*det <= SAFE;
+      const reachF = fast.filter(inSeg);
+      let pick = null, slow = false;
+      if (reachF.length) pick = reachF[reachF.length-1];
+      else { const reachA = corridor.filter(inSeg); if (reachA.length){ pick = reachA[reachA.length-1]; slow = true; } }
+      if (!pick){ gaps.push({ fromPos: cur }); break; }
+      stops.push(Object.assign({}, pick, { slow }));
+      cur = pick.pos;
+      if (++guard > 300) break;
+    }
+    if (gaps.length) break;
+    if (tgt.stop){
+      stops.push(Object.assign({}, tgt.stop, { slow: !!(tgt.stop.kw && +tgt.stop.kw < FAST_KW) }));
+      cur = tgt.pos;
+    }
+  }
+  return { stops, gaps, corridor, L, reachedEnd: gaps.length === 0 };
+}
+
+/* ---------------- data loading ---------------- */
+const countryCache = {};
+async function loadCountry(cc){
+  cc = (cc||'').toLowerCase();
+  if (!cc) return [];
+  if (countryCache[cc]) return countryCache[cc];
+  try {
+    const r = await fetch(`ev/${cc}.json`, { cache:'force-cache' });
+    if (!r.ok){ countryCache[cc] = []; return []; }
+    const j = await r.json();
+    countryCache[cc] = j.chargers || [];
+    return countryCache[cc];
+  } catch(e){ countryCache[cc] = []; return []; }
+}
+
+async function geocode(q){
+  const url = 'https://nominatim.openstreetmap.org/search?' +
+    new URLSearchParams({ q, format:'json', limit:'1', addressdetails:'1', 'accept-language':'en' });
+  const r = await fetch(url, { headers:{ 'Accept':'application/json' } });
+  const j = await r.json();
+  if (!j || !j.length) return null;
+  const g = j[0];
+  return { lat:+g.lat, lon:+g.lon,
+           cc:((g.address && g.address.country_code) || '').toUpperCase(),
+           name:(g.display_name||q).split(',')[0] };
+}
+
+function haversineKm(a1,o1,a2,o2){
+  const R=6371, r=Math.PI/180, dp=(a2-a1)*r, dl=(o2-o1)*r;
+  const x=Math.sin(dp/2)**2 + Math.cos(a1*r)*Math.cos(a2*r)*Math.sin(dl/2)**2;
+  return 2*R*Math.asin(Math.sqrt(x));
+}
+
+// OpenRouteService routing — ferry-aware, gives alternatives. Uses the coded-in key.
+// waytype extra marks ferry segments (code 9); we estimate the crossing time from its length.
+async function orsRoutes(pts, key){
+  async function fetchOrs(withAlt){
+    const body = { coordinates: pts.map(p => [p.lon, p.lat]), extra_info: ["waytype"] };
+    // ORS rejects alternative_routes on long routes, so only ask for them on short 2-point trips.
+    if (withAlt && pts.length === 2)
+      body.alternative_routes = { target_count: 2, share_factor: 0.6, weight_factor: 1.6 };
+    const r = await fetch('https://api.openrouteservice.org/v2/directions/driving-car/geojson', {
+      method:'POST', headers:{ 'Authorization': key, 'Content-Type':'application/json' },
+      body: JSON.stringify(body)
+    });
+    if (!r.ok) throw new Error('ORS HTTP ' + r.status);
+    return r.json();
+  }
+  let j;
+  try { j = await fetchOrs(true); }          // with alternatives (may 400 on long routes)
+  catch(e){ j = await fetchOrs(false); }     // retry plain so long routes still succeed
+  if (!j.features || !j.features.length) throw new Error('no route');
+  return j.features.map(f => {
+    const coords = f.geometry.coordinates.map(c => ({ lat:c[1], lon:c[0] }));
+    const sum = f.properties.summary || {};
+    let ferryKm = 0, ferryCount = 0;
+    const wt = (f.properties.extras && f.properties.extras.waytype && f.properties.extras.waytype.values) || [];
+    for (const [a,b,code] of wt){
+      if (code === 9){ ferryCount++;
+        for (let i=a; i<b && i+1<coords.length; i++)
+          ferryKm += haversineKm(coords[i].lat, coords[i].lon, coords[i+1].lat, coords[i+1].lon);
+      }
+    }
+    return { coords, distKm:(sum.distance||0)/1000, durationH:(sum.duration||0)/3600,
+             ferryMin: ferryKm>0 ? ferryKm/35*60 : 0,      // ~35 km/h ferry, rough
+             ferryName: ferryCount ? 'Ferry crossing' : '', ferryCount };
+  });
+}
+
+// Decode an encoded polyline (Valhalla uses precision 6).
+function decodePolyline(str, precision){
+  let index=0, lat=0, lng=0, out=[], shift, result, byte;
+  const factor = Math.pow(10, precision || 6);
+  while (index < str.length){
+    shift=0; result=0;
+    do { byte = str.charCodeAt(index++) - 63; result |= (byte & 0x1f) << shift; shift += 5; } while (byte >= 0x20);
+    lat += (result & 1) ? ~(result >> 1) : (result >> 1);
+    shift=0; result=0;
+    do { byte = str.charCodeAt(index++) - 63; result |= (byte & 0x1f) << shift; shift += 5; } while (byte >= 0x20);
+    lng += (result & 1) ? ~(result >> 1) : (result >> 1);
+    out.push({ lat: lat/factor, lon: lng/factor });
+  }
+  return out;
+}
+
+// Valhalla routing via the free, KEYLESS FOSSGIS server (powers openstreetmap.org).
+// Handles ferries natively and reports the ferry leg's own time. Fair-use: light use only.
+async function valhallaRoutes(pts){
+  // GET with ?json= is a "simple" cross-origin request → no CORS preflight. (POST + JSON
+  // triggers a preflight the FOSSGIS server doesn't answer, which made it silently fail.)
+  async function fetchTrips(legPts, extra){
+    const req = Object.assign({ locations: legPts.map(p => ({ lat:p.lat, lon:p.lon })), costing:'auto',
+                                directions_options:{ units:'kilometers' } }, extra || {});
+    const url = 'https://valhalla1.openstreetmap.de/route?json=' + encodeURIComponent(JSON.stringify(req));
+    const r = await fetch(url);
+    if (!r.ok) throw new Error('Valhalla HTTP ' + r.status);
+    const j = await r.json();
+    return [j.trip].concat((j.alternates||[]).map(a => a.trip)).filter(Boolean);
+  }
+  const parse = t => {
+    let coords = [], ferrySec = 0, ferryCount = 0;
+    for (const leg of (t.legs || [])){
+      coords = coords.concat(decodePolyline(leg.shape, 6));
+      for (const m of (leg.maneuvers || []))
+        if (m.type === 28 || m.travel_mode === 'ferry' ||
+            (m.instruction && /take (the )?ferry|board the ferry/i.test(m.instruction))){
+          ferrySec += m.time || 0; ferryCount++;
+        }
+    }
+    const s = t.summary || {};
+    return { coords, distKm:s.length || 0, durationH:(s.time || 0)/3600,
+             ferryMin: ferrySec/60, ferryName: ferryCount ? 'Ferry crossing' : '', ferryCount };
+  };
+
+  // 2 points → fastest + a genuine ferry alternative (short routes fit in one request).
+  if (pts.length === 2){
+    const fastest = (await fetchTrips(pts, {})).map(parse);
+    const routes = [...fastest];
+    if (!fastest.some(r => r.ferryCount > 0)){
+      try {
+        const fer = (await fetchTrips(pts, { costing_options:{ auto:{ use_ferry: 1 } } }))
+                      .map(parse).filter(r => r.ferryCount > 0);
+        if (fer.length) routes.push(fer[0]);
+      } catch(e){}
+    }
+    if (!routes.length) throw new Error('no route');
+    return routes;
+  }
+
+  // 3+ points → route each leg separately so every request stays within the free server's
+  // limit. This is how ferries survive on long, multi-stop trips keylessly (the leg that
+  // includes the crossing routes on Valhalla). OSRM covers any single leg still too long.
+  let coords = [], distKm = 0, durationH = 0, ferryMin = 0, ferryCount = 0, ferryName = '', first = true;
+  for (let i=0;i<pts.length-1;i++){
+    let rt;
+    try { rt = parse((await fetchTrips([pts[i], pts[i+1]], {}))[0]); }
+    catch(e){ rt = (await osrmRoutes([pts[i], pts[i+1]]))[0]; }
+    coords = coords.concat(first ? rt.coords : rt.coords.slice(1));
+    distKm += rt.distKm; durationH += rt.durationH; ferryMin += rt.ferryMin; ferryCount += rt.ferryCount;
+    if (rt.ferryName && !ferryName) ferryName = rt.ferryName;
+    first = false;
+  }
+  return [{ coords, distKm, durationH, ferryMin, ferryName, ferryCount }];
+}
+
+// Trace the real driving route(s) through the road network (OSRM — RoadScout-style).
+// Returns one or more routes (alternatives when there are just two points), each with
+// geometry, driving distance/time, and any ferry crossing time (OSRM routes over ferries).
+async function osrmRoutes(pts){
+  const coords = pts.map(p => `${p.lon},${p.lat}`).join(';');
+  const alt = pts.length === 2 ? 'true' : 'false';   // OSRM only alternates for 2 points
+  const url = `https://router.project-osrm.org/route/v1/driving/${coords}` +
+    `?overview=full&geometries=geojson&alternatives=${alt}&steps=true`;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error('routing HTTP ' + r.status);
+  const j = await r.json();
+  if (!j.routes || !j.routes.length) throw new Error('no route');
+  return j.routes.map(rt => {
+    let ferrySec = 0, ferryName = '', ferryCount = 0;
+    for (const leg of (rt.legs || []))
+      for (const st of (leg.steps || []))
+        if (st.mode === 'ferry'){ ferrySec += st.duration || 0; ferryCount++; if (!ferryName) ferryName = st.name || 'Ferry'; }
+    return {
+      coords: rt.geometry.coordinates.map(c => ({ lat:c[1], lon:c[0] })),
+      distKm: rt.distance / 1000, durationH: rt.duration / 3600,
+      ferryMin: ferrySec / 60, ferryName, ferryCount
+    };
+  });
+}
+
+// Nearest town/city for a point (cached). Only called for the few planned stops.
+const revCache = {};
+async function reverseGeocode(lat, lon){
+  const key = lat.toFixed(3) + ',' + lon.toFixed(3);
+  if (revCache[key] !== undefined) return revCache[key];
+  try {
+    const url = 'https://nominatim.openstreetmap.org/reverse?' +
+      new URLSearchParams({ lat, lon, format:'json', zoom:'12', addressdetails:'1', 'accept-language':'en' });
+    const r = await fetch(url, { headers:{ 'Accept':'application/json' } });
+    const j = await r.json();
+    const a = j.address || {};
+    const name = a.city || a.town || a.village || a.municipality || a.suburb || a.county || a.state || '';
+    revCache[key] = name; return name;
+  } catch(e){ revCache[key] = ''; return ''; }
+}
+
+/* ---------------- waypoint inputs ---------------- */
+function addStopField(value){
+  const wrap = document.createElement('div');
+  wrap.className = 'field wprow';
+  const inp = document.createElement('input');
+  inp.placeholder = 'via…'; inp.autocomplete = 'off'; if (value) inp.value = value;
+  const del = document.createElement('button'); del.textContent = '×'; del.title = 'remove';
+  del.onclick = () => wrap.remove();
+  wrap.appendChild(inp); wrap.appendChild(del);
+  $('stops').appendChild(wrap);
+  attachAutocomplete(inp);
+}
+$('addStop').addEventListener('click', () => addStopField(''));
+
+/* ---------------- place-search autocomplete ----------------
+   Photon (photon.komoot.io) is built for type-ahead: it returns good matches from the first
+   few letters and takes a lat/lon bias, so nearby places come first. That fixes both problems
+   the old Nominatim-only box had — you had to type the (almost) full name, and results were
+   biased to the US. Nominatim is kept as a fallback if Photon is unreachable. */
+let userLoc = null, geoAsked = false;
+function askGeo(){                                    // once, when a search box is focused
+  if (geoAsked || !navigator.geolocation) return;
+  geoAsked = true;
+  navigator.geolocation.getCurrentPosition(
+    p => { userLoc = { lat:p.coords.latitude, lon:p.coords.longitude }; },
+    () => {}, { timeout:8000, maximumAge:600000 });
+}
+// One normalized shape for suggestions: { label, name, lat, lon, cc }.
+function photonLabel(pr){
+  const parts = [pr.name,
+    pr.city && pr.city !== pr.name ? pr.city : '',
+    pr.state || '', pr.country || ''].filter(Boolean);
+  return [...new Set(parts)].join(', ');
+}
+async function searchPlaces(q){
+  // 1) Photon — great partial matches, biased to the user (or Europe by default).
+  try {
+    const bias = userLoc || { lat:50, lon:10 };        // central Europe if location unknown
+    const url = 'https://photon.komoot.io/api/?' + new URLSearchParams({
+      q, limit:'8', lang:'en', lat:String(bias.lat), lon:String(bias.lon) });
+    const r = await fetch(url);
+    if (r.ok){
+      const j = await r.json();
+      const out = (j.features || []).map(f => {
+        const pr = f.properties || {}, g = (f.geometry && f.geometry.coordinates) || [];
+        if (g.length < 2) return null;
+        if (!pr.name) return null;
+        return { label: photonLabel(pr), name: pr.name,
+                 lon:+g[0], lat:+g[1], cc:(pr.countrycode || '').toUpperCase() };
+      }).filter(Boolean);
+      // de-dupe identical labels
+      const seen = new Set(), uniq = [];
+      for (const o of out){ if (seen.has(o.label)) continue; seen.add(o.label); uniq.push(o); }
+      if (uniq.length) return uniq.slice(0, 7);
+    }
+  } catch(e){ /* fall through to Nominatim */ }
+  // 2) Nominatim fallback.
+  try {
+    const vb = userLoc ? [userLoc.lon-4, userLoc.lat+4, userLoc.lon+4, userLoc.lat-4]
+                       : [-11, 60, 30, 35];
+    const url = 'https://nominatim.openstreetmap.org/search?' + new URLSearchParams({
+      q, format:'json', limit:'7', addressdetails:'1', 'accept-language':'en', viewbox: vb.join(',') });
+    const r = await fetch(url, { headers:{ 'Accept':'application/json' } });
+    const j = await r.json();
+    return (j || []).map(res => ({
+      label: res.display_name, name: res.display_name.split(',')[0],
+      lat:+res.lat, lon:+res.lon,
+      cc:((res.address && res.address.country_code) || '').toUpperCase() }));
+  } catch(e){ return []; }
+}
+function attachAutocomplete(input){
+  let box = null, timer = null, seq = 0;
+  const close = () => { if (box){ box.remove(); box = null; } };
+  input.setAttribute('autocomplete', 'off');
+  input.addEventListener('focus', askGeo);
+  input.addEventListener('input', () => {
+    delete input.dataset.lat; delete input.dataset.lon;   // typing invalidates a previous pick
+    clearTimeout(timer);
+    const q = input.value.trim();
+    if (q.length < 2){ close(); return; }                 // 2 letters is enough for Photon
+    const mine = ++seq;
+    timer = setTimeout(async () => {
+      const results = await searchPlaces(q);
+      if (mine !== seq) return;                            // a newer keystroke already fired
+      render(results);
+    }, 250);
+  });
+  input.addEventListener('blur', () => setTimeout(close, 150));
+  function render(results){
+    close();
+    if (!results || !results.length) return;
+    box = document.createElement('div'); box.className = 'acbox';
+    results.forEach(res => {
+      const it = document.createElement('div'); it.className = 'acitem'; it.textContent = res.label;
+      it.addEventListener('mousedown', e => {          // mousedown fires before blur
+        e.preventDefault();
+        input.value = res.name;
+        input.dataset.lat = res.lat; input.dataset.lon = res.lon;
+        input.dataset.cc = res.cc || '';
+        input.dataset.name = res.name;
+        close();
+      });
+      box.appendChild(it);
+    });
+    (input.closest('.field') || input.parentElement).appendChild(box);
+  }
+}
+// Resolve a place input to coords — from a picked suggestion if present, else geocode the text.
+async function resolvePlace(el){
+  const q = el.value.trim();
+  if (!q) return null;
+  if (el.dataset.lat && el.dataset.lon)
+    return { lat:+el.dataset.lat, lon:+el.dataset.lon, cc:(el.dataset.cc||''), name:(el.dataset.name||q) };
+  return geocode(q);
+}
+attachAutocomplete($('fStart'));
+attachAutocomplete($('fEnd'));
+
+/* ---------------- EV car specs (bundled ev-cars.json) ---------------- */
+let CARS = [];
+
+async function loadCars(){
+  try {
+    const r = await fetch('ev-cars.json');
+    const j = await r.json();
+    CARS = j.cars || [];
+  } catch(e){
+    CARS = [{ brand:'BMW', model:'iX1 eDrive20', battery:64.7, range:475, maxkw:130 },
+            { brand:'Tesla', model:'Model 3 Long Range', battery:75, range:629, maxkw:250 }];
+  }
+  const sel = $('fCar'); sel.innerHTML = '';
+  const byBrand = {};
+  for (const c of CARS) (byBrand[c.brand] = byBrand[c.brand] || []).push(c);
+  for (const brand of Object.keys(byBrand).sort()){
+    const og = document.createElement('optgroup'); og.label = brand;
+    for (const c of byBrand[brand]){
+      const o = document.createElement('option');
+      o.value = `${c.brand} ${c.model}`;
+      o.textContent = `${c.model} — ~${c.range} km`;
+      o.dataset.batt = c.battery; o.dataset.range = c.range; o.dataset.maxkw = c.maxkw;
+      og.appendChild(o);
+    }
+    sel.appendChild(og);
+  }
+  const cu = document.createElement('option'); cu.value = 'custom';
+  cu.textContent = 'Custom / other model…'; sel.appendChild(cu);
+  sel.value = 'BMW iX1 eDrive20';                       // sensible default
+  onCarChange();
+}
+// Selected model → fill range + show specs; "Custom" reveals manual battery/kW entry.
+function onCarChange(){
+  const o = $('fCar').selectedOptions[0];
+  if (!o || o.value === 'custom'){
+    $('manualSpec').style.display = 'block';
+    $('carSpec').textContent = 'Enter battery (usable kWh), max DC (kW) and range for your model.';
+    return;
+  }
+  $('fRange').value = o.dataset.range;
+  $('manualSpec').style.display = 'none';
+  $('carSpec').innerHTML = `<b>${o.dataset.batt} kWh</b> usable · <b>${o.dataset.maxkw} kW</b> max DC · ~${o.dataset.range} km WLTP`;
+}
+// Resolve the car for planning: from the dropdown, or manual fields / an estimate.
+function resolveCar(){
+  const o = $('fCar').selectedOptions[0];
+  const rangeKm = Math.max(50, +$('fRange').value || 0);
+  if (o && o.value !== 'custom')
+    return { model:o.value, batt:+o.dataset.batt, maxkw:+o.dataset.maxkw, rangeKm, known:true };
+  const batt = +$('fBatt').value || (rangeKm * 0.16);
+  const maxkw = +$('fMaxkw').value || 120;
+  return { model:'Custom EV', batt, maxkw, rangeKm, known:false };
+}
+$('fCar').addEventListener('change', onCarChange);
+loadCars();
+
+/* ---------------- main: plan a trip ---------------- */
+$('planBtn').addEventListener('click', planTrip);
+
+let TRIP = null;   // current trip: { pts, routes, chargers, car, realRoad }
+
+async function planTrip(){
+  const startQ = $('fStart').value.trim();
+  const endQ   = $('fEnd').value.trim();
+  const car = resolveCar();
+  const maxHours = +$('fMaxDay').value || 0;   // 0 = one push, no overnight splits
+  const viaEls = [...$('stops').querySelectorAll('input')].filter(i => i.value.trim());
+  if (!startQ || !endQ){ setBusy('Enter a start and a destination.'); return; }
+  if (!car.rangeKm){ setBusy('Enter your car’s range in km.'); return; }
+
+  setBusy('Finding your places…'); $('planBtn').disabled = true;
+  try {
+    const start = await resolvePlace($('fStart'));
+    const end   = await resolvePlace($('fEnd'));
+    if (!start || !end){ setBusy('Couldn’t find the start or destination.'); $('planBtn').disabled=false; return; }
+    const vias = [];
+    for (const el of viaEls){
+      const g = await resolvePlace(el);
+      if (!g){ setBusy(`Couldn’t find “${el.value.trim()}”. Try a more specific name.`); $('planBtn').disabled=false; return; }
+      vias.push(g);
+    }
+    TRIP = { start, end, vias, car, maxHours };
+    await computeAndRender();
+    $('planBtn').disabled = false;
+    $('start').style.display = 'none'; map.resize();
+    setTimeout(() => map.resize(), 250);
+  } catch(err){
+    setBusy('Something went wrong: ' + err.message);
+    $('planBtn').disabled = false;
+  }
+}
+
+// Route + load chargers + plan, from TRIP.start / TRIP.vias / TRIP.end. Re-run whenever the
+// waypoints change — e.g. the user clicks a charger to force it into the route.
+async function computeAndRender(){
+  const pts = [TRIP.start, ...TRIP.vias, TRIP.end];
+  setBusy('Tracing the road…');
+  // ORS (ferry-aware) when a key is coded in; else OSRM; straight-line as last resort.
+  let routes, realRoad = false, engine = null;
+  try {
+    if (ORS_KEY){ routes = await orsRoutes(pts, ORS_KEY); engine = 'OpenRouteService'; }
+    else        { routes = await valhallaRoutes(pts);     engine = 'Valhalla'; }
+    realRoad = true;
+  } catch(e){
+    try { routes = await osrmRoutes(pts); engine = 'OSRM'; realRoad = true; }
+    catch(e2){
+      routes = [{ coords: pts.map(p => ({ lat:p.lat, lon:p.lon })),
+                  distKm:null, durationH:null, ferryMin:0, ferryName:'', ferryCount:0 }];
+      realRoad = false;
+    }
+  }
+  setBusy('Loading chargers…');
+  const ccSet = new Set();
+  for (const rt of routes)
+    (realRoad ? countriesAlong(rt.coords) : routeCountries(pts)).forEach(c => ccSet.add(c));
+  pts.forEach(p => { if (p.cc) ccSet.add(p.cc.toLowerCase()); });
+  const lists = await Promise.all([...ccSet].map(loadCountry));
+  const chargers = [].concat(...lists);
+  if (!chargers.length){
+    setBusy('No charger data for this route yet (Europe, North America & Australia are covered).');
+    return;
+  }
+  TRIP.pts = pts; TRIP.routes = routes; TRIP.chargers = chargers; TRIP.realRoad = realRoad; TRIP.engine = engine;
+  await planOnRoute(0);
+}
+
+// Split the plan into day-legs by a max driving-hours/day cap. Marks the last stop reachable
+// within each day as an overnight, tags each stop with its day number, returns the day count.
+function splitDays(stops, L, drivingH, maxHours){
+  stops.forEach(s => { s.dayNum = 1; s.overnight = false; });
+  if (!maxHours || maxHours <= 0 || !drivingH || !stops.length) return 1;
+  const timeAt = pos => (L > 0 ? (pos / L) * drivingH : 0);
+  let dayStart = 0, day = 1, lastInDay = null;
+  const seq = stops.map(s => ({ s, t: timeAt(s.pos) })).concat([{ s:null, t: drivingH }]);
+  for (const p of seq){
+    if (p.t - dayStart > maxHours + 1e-6 && lastInDay){
+      lastInDay.overnight = true;
+      dayStart = timeAt(lastInDay.pos);
+      day++;
+      lastInDay = null;
+    }
+    if (p.s){ p.s.dayNum = day; lastInDay = p.s; }
+  }
+  return day;
+}
+
+// Plan charging on one of the traced routes (called by the route selector and add-stop too).
+async function planOnRoute(idx){
+  TRIP.currentIdx = idx;
+  const { routes, chargers, car, realRoad } = TRIP;
+  const pts = TRIP.pts;
+  const rt = routes[idx];
+  const det = realRoad ? 1.0 : DETOUR;
+
+  setOrigin(rt.coords[0].lat, rt.coords[0].lon);
+  const geoPts = downsample(rt.coords, 1200);
+  const routeXY = geoPts.map(p => toXY(p.lat, p.lon));
+  const segCum = [0];
+  for (let i=0;i<routeXY.length-1;i++)
+    segCum.push(segCum[i] + hypot(routeXY[i+1][0]-routeXY[i][0], routeXY[i+1][1]-routeXY[i][1]));
+  const L = segCum[segCum.length-1];
+  for (const c of chargers) c._xy = toXY(c.lat, c.lon);
+
+  const forced = (TRIP.vias || []).filter(v => v.forced);   // charger stops the user clicked in
+  const result = planStops(routeXY, segCum, L, chargers, car.rangeKm, det, forced);
+
+  setBusy('Naming your stops…');
+  await Promise.all(result.stops.map(async s => {
+    s.place = s.town || await reverseGeocode(s.lat, s.lon);
+  }));
+
+  // Charging time per stop = energy for the next leg ÷ effective power (min of charger &
+  // the car's max DC rate, ×0.85 for real-world taper). Uses the resolved car's battery.
+  const consumption = car.batt / car.rangeKm;
+  let chargeH = 0;
+  result.stops.forEach((s, i) => {
+    const nextPos = (i+1 < result.stops.length) ? result.stops[i+1].pos : L;
+    const legKm = Math.max(0, (nextPos - s.pos) * det);
+    const energy = Math.min(consumption * legKm, car.batt * 0.8);
+    s.addKWh = energy;
+    const eff = Math.min((+s.kw || 50), car.maxkw) * 0.85;
+    s.chargeMin = eff > 0 ? energy / eff * 60 : null;
+    if (s.chargeMin) chargeH += s.chargeMin / 60;
+  });
+
+  const distKm = (rt.distKm != null) ? rt.distKm : L * det;
+  const drivingH = (rt.durationH != null) ? rt.durationH : distKm / 100;
+  const nDays = splitDays(result.stops, L, drivingH, TRIP.maxHours || 0);
+  setBusy('');
+  renderTrip({ pts, routeGeo: rt.coords, result, car, realRoad, det,
+               distKm, drivingH, chargeH, ferryMin: rt.ferryMin, ferryName: rt.ferryName, routeIdx: idx,
+               nDays, maxHours: TRIP.maxHours || 0 });
+}
+function setBusy(t){ $('busy').textContent = t; }
+
+/* ---------------- render ---------------- */
+let openPopup = null, hotelMarkers = [], altMarkers = [];
+function showPopup(lngLat, html){
+  if (openPopup) openPopup.remove();
+  openPopup = new maplibregl.Popup().setLngLat(lngLat).setHTML(html).addTo(map);
+  return openPopup;
+}
+function nearestIdx(lat, lon, geo){
+  let best = Infinity, bi = 0;
+  for (let i=0;i<geo.length;i++){ const dx=geo[i].lat-lat, dy=geo[i].lon-lon, d=dx*dx+dy*dy; if (d<best){ best=d; bi=i; } }
+  return bi;
+}
+function orderVias(vias, geo){
+  return vias.map(v => ({ v, k: nearestIdx(v.lat, v.lon, geo) })).sort((a,b)=>a.k-b.k).map(o=>o.v);
+}
+// Clicked a charger's "Add to route" → force it in as a stop, re-route, renumber, recalc.
+async function addUserStop(lat, lon){
+  if (!TRIP) return;
+  if ((TRIP.vias||[]).some(v => Math.abs(v.lat-lat)<1e-5 && Math.abs(v.lon-lon)<1e-5)) return;   // already added
+  const c = (TRIP.chargers||[]).find(x => Math.abs(x.lat-lat)<1e-5 && Math.abs(x.lon-lon)<1e-5) || { lat, lon, name:'Charging stop' };
+  const ref = (TRIP.routes && TRIP.routes[TRIP.currentIdx||0]) ? TRIP.routes[TRIP.currentIdx||0].coords : [{lat,lon}];
+  TRIP.vias = orderVias([...(TRIP.vias||[]), Object.assign({}, c, { forced:true })], ref);
+  if (openPopup){ openPopup.remove(); openPopup = null; }
+  $('planBtn').disabled = true;
+  try { await computeAndRender(); }
+  catch(e){ /* keep previous view */ }
+  finally { $('planBtn').disabled = false; }
+}
+
+/* ---------------- accommodation (Stay Nearby) ----------------
+   Borrowed from BeachScout: a full-screen overlay page with a Back button and a scrollable
+   list. Overpass is the data source, but hit through several mirrors with a fallback so a
+   single overloaded server no longer means "it doesn't work". On Back, the found places are
+   drawn on the map as dark-purple dots. */
+const OVERPASS_MIRRORS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
+  'https://overpass.private.coffee/api/interpreter'
+];
+// POST with x-www-form-urlencoded is a "simple" request (no CORS preflight) and dodges URL limits.
+async function overpassQuery(q){
+  let lastErr;
+  for (const url of OVERPASS_MIRRORS){
+    try {
+      const r = await fetch(url, { method:'POST', body:'data=' + encodeURIComponent(q),
+        headers:{ 'Content-Type':'application/x-www-form-urlencoded' } });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return await r.json();
+    } catch(e){ lastErr = e; }   // try the next mirror
+  }
+  throw lastErr || new Error('all Overpass mirrors failed');
+}
+
+let lastStay = [], stayCenter = null;
+async function findAccommodation(lat, lon){
+  if (openPopup){ openPopup.remove(); openPopup = null; }
+  stayCenter = { lat:+lat, lon:+lon };
+  $('stayTitle').textContent = 'Accommodation within 3 km';
+  $('stayStatus').textContent = '🔎 Searching accommodation within 3 km…';
+  $('stayList').innerHTML = '';
+  $('stayPage').classList.add('show');
+  $('stayPage').scrollTop = 0;
+  const q = `[out:json][timeout:40];(` +
+    `nwr["tourism"~"^(hotel|guest_house|apartment|hostel|motel|chalet|cottage|guesthouse|bed_and_breakfast|holiday_home|camp_site|caravan_site)$"](around:3000,${lat},${lon});` +
+    `nwr["amenity"="bed_and_breakfast"](around:3000,${lat},${lon});` +
+    `);out center tags 150;`;
+  let j;
+  try { j = await overpassQuery(q); }
+  catch(e){ $('stayStatus').textContent = 'Couldn’t reach the accommodation search right now — please try again in a moment.'; return; }
+  const list = (j.elements || []).map(e => {
+    const la = (e.lat != null) ? e.lat : (e.center && e.center.lat);
+    const lo = (e.lon != null) ? e.lon : (e.center && e.center.lon);
+    if (la == null || lo == null) return null;
+    const t = e.tags || {};
+    return { lat:la, lon:lo, name:t.name || 'Accommodation',
+             type:(t.tourism || t.amenity || '').replace(/_/g,' '), stars:t.stars || '',
+             addr:[t['addr:street'], t['addr:housenumber'], t['addr:postcode'], t['addr:city']].filter(Boolean).join(' '),
+             phone:t.phone || t['contact:phone'] || '', website:t.website || t['contact:website'] || '',
+             _d: haversineKm(+lat, +lon, la, lo) };
+  }).filter(Boolean);
+  list.sort((a,b) => a._d - b._d);
+  lastStay = list;
+  if (!list.length){
+    $('stayStatus').textContent = 'No accommodation mapped within 3 km here — OpenStreetMap coverage is thin in some areas. Try a nearby stop.';
+    return;
+  }
+  $('stayStatus').innerHTML = `<b>${list.length}</b> place${list.length>1?'s':''} within 3 km · press <b>← Back to map</b> to see them as <span style="color:#5a2a82">●</span> purple dots.`;
+  $('stayList').innerHTML = list.map(stayCardHtml).join('');
+}
+function stayCardHtml(h){
+  const meta = [];
+  if (h.type) meta.push(esc(h.type) + (h.stars ? ` · ${esc(h.stars)}★` : ''));
+  meta.push(`~${h._d.toFixed(1)} km away`);
+  if (h.addr) meta.push(esc(h.addr));
+  if (h.phone) meta.push('☎ ' + esc(h.phone));
+  const dir = `https://www.google.com/maps/dir/?api=1&destination=${h.lat},${h.lon}`;
+  const web = h.website ? `<div class="t" style="margin-top:4px"><a href="${esc(h.website)}" target="_blank" rel="noopener">Website ↗</a></div>` : '';
+  return `<div class="stay-result"><h3>🏨 ${esc(h.name)}</h3>
+    <div class="t">${meta.join('<br>')}</div>
+    <a class="stay-dir" href="${dir}" target="_blank" rel="noopener">🧭 Directions in Google Maps ↗</a>${web}</div>`;
+}
+// Back to map → close the overlay and drop the found places as dark-purple dots.
+$('stayBack').addEventListener('click', () => {
+  $('stayPage').classList.remove('show');
+  if (lastStay.length) renderStayDots(lastStay, stayCenter);
+});
+function renderStayDots(list, center){
+  clearStayDots();
+  map.addSource('stay-dots', { type:'geojson', data:{ type:'FeatureCollection',
+    features: list.map(h => ({ type:'Feature',
+      properties:{ info: `<h3>🏨 ${esc(h.name)}</h3>` +
+        `<div class="t" style="margin-top:6px">${[h.type?esc(h.type):'', `~${h._d.toFixed(1)} km away`, h.addr?esc(h.addr):''].filter(Boolean).join('<br>')}</div>` +
+        `<div class="t" style="margin-top:6px"><a href="https://www.google.com/maps/dir/?api=1&destination=${h.lat},${h.lon}" target="_blank" rel="noopener">🧭 Directions in Google Maps ↗</a></div>` },
+      geometry:{ type:'Point', coordinates:[h.lon, h.lat] } })) } });
+  map.addLayer({ id:'stay-dots', type:'circle', source:'stay-dots',
+    paint:{ 'circle-radius':['interpolate',['linear'],['zoom'], 9,5, 13,8, 16,12],
+            'circle-color':'#5a2a82', 'circle-opacity':0.95,
+            'circle-stroke-width':2, 'circle-stroke-color':'#fff' } });
+  if (!renderStayDots._bound){                       // bind click/hover once, not per Back-press
+    renderStayDots._bound = true;
+    map.on('click', 'stay-dots', e => showPopup(e.lngLat, e.features[0].properties.info));
+    map.on('mouseenter', 'stay-dots', ()=> map.getCanvas().style.cursor='pointer');
+    map.on('mouseleave', 'stay-dots', ()=> map.getCanvas().style.cursor='');
+  }
+  const lons = list.map(h=>h.lon).concat(center.lon), lats = list.map(h=>h.lat).concat(center.lat);
+  map.fitBounds([[Math.min(...lons),Math.min(...lats)],[Math.max(...lons),Math.max(...lats)]],
+    { padding:70, maxZoom:14 });
+}
+function clearStayDots(){
+  if (map.getLayer('stay-dots')) map.removeLayer('stay-dots');
+  if (map.getSource('stay-dots')) map.removeSource('stay-dots');
+}
+function clearHotels(){ clearStayDots(); hotelMarkers.forEach(m => m.remove()); hotelMarkers = []; }
+
+/* ---------------- nearby charging alternatives (if a charger is down) ----------------
+   Uses the chargers already loaded for the trip (no network call, works offline), so a
+   driver at a dead/occupied charger can instantly see what else is within reach. */
+function tierOf(kw){ kw = (kw===''||kw==null)?0:+kw; return kw>=ULTRA_KW?2:(kw>=FAST_KW?1:0); }
+// A polygon ring approximating a circle of `km` radius (for the radius outline on the map).
+function circlePolygon(lat, lon, km, n){
+  n = n || 72;
+  const dLat = km/111.32, dLon = km/(111.32*Math.cos(lat*Math.PI/180)), ring = [];
+  for (let i=0;i<=n;i++){ const a = 2*Math.PI*i/n; ring.push([lon+dLon*Math.cos(a), lat+dLat*Math.sin(a)]); }
+  return ring;
+}
+let altRadiusKm = 10, altCenter = null, altList = [];
+function showAlternatives(lat, lon){
+  lat = +lat; lon = +lon;
+  // recover the clicked charger's operator (if any) so we can flag same-network options
+  const src = (TRIP && TRIP.chargers || []).find(c => Math.abs(c.lat-lat)<1e-5 && Math.abs(c.lon-lon)<1e-5);
+  altCenter = { lat, lon, op: src ? (src.operator||'') : '' };
+  altRadiusKm = 10;                                   // fresh open always starts at 10 km
+  if (openPopup){ openPopup.remove(); openPopup = null; }
+  $('altPage').classList.add('show');
+  $('altPage').scrollTop = 0;
+  renderAlternatives();
+}
+function renderAltToggle(){
+  const box = $('altToggle'); box.innerHTML = '';
+  [5,10,20].forEach(km => {
+    const b = document.createElement('button');
+    b.className = 'alt-chip' + (km===altRadiusKm ? ' on' : '');
+    b.textContent = km + ' km';
+    b.onclick = () => { altRadiusKm = km; renderAlternatives(); };
+    box.appendChild(b);
+  });
+}
+function renderAlternatives(){
+  const { lat, lon, op } = altCenter, R = altRadiusKm;
+  const all = (TRIP && TRIP.chargers) ? TRIP.chargers : [];
+  const list = [];
+  for (const c of all){
+    if (c.lat==null || c.lon==null) continue;
+    const d = haversineKm(lat, lon, c.lat, c.lon);
+    if (d > R || d < 0.03) continue;                  // outside radius, or the clicked charger itself
+    list.push(Object.assign({}, c, { _d:d }));
+  }
+  list.sort((a,b) => a._d - b._d);
+  altList = list.slice(0, 80);
+  $('altTitle').textContent = `Charging within ${R} km`;
+  renderAltToggle();
+  if (!altList.length){
+    $('altStatus').textContent = `No other chargers within ${R} km in the loaded data — try a wider radius.`;
+    $('altList').innerHTML = '';
+    return;
+  }
+  const fast = altList.filter(c => tierOf(c.kw) >= 1).length;
+  $('altStatus').innerHTML = `<b>${altList.length}</b> charger${altList.length>1?'s':''} within ${R} km · <b>${fast}</b> fast/ultra · press <b>← Back to map</b> to see them on the map. Live availability lives in your charging app — this shows what’s mapped, not real-time status.`;
+  $('altList').innerHTML = altList.map(c => altCardHtml(c, op)).join('');
+}
+function altCardHtml(c, srcOp){
+  const t = tierOf(c.kw);
+  const tierLabel = t===2 ? '⚡⚡ ultra-rapid' : (t===1 ? '⚡ fast DC' : 'AC / slow');
+  const tierColor = t===2 ? '#111111' : (t===1 ? '#0a5d2e' : '#7bbf9c');
+  const apps = appsFor(`${c.operator||''} ${c.name||''}`);
+  const sameOp = srcOp && c.operator && c.operator.toLowerCase() === srcOp.toLowerCase();
+  const meta = [];
+  meta.push(`<span style="color:${tierColor};font-weight:bold">${tierLabel}${c.kw?` · ${esc(c.kw)} kW`:''}</span>`);
+  meta.push(`~${c._d.toFixed(1)} km away`);
+  if (c.operator) meta.push('Operator: ' + esc(c.operator) + (sameOp ? ' <span style="color:#b5471f">· same network</span>' : ''));
+  meta.push(`Charging: ${c.cost ? esc(c.cost) : 'cost not listed'}`);
+  meta.push(apps.length ? `Apps: ${esc(apps.join(', '))}` : `Apps: roaming (${ROAMING_APPS})`);
+  const dir = `https://www.google.com/maps/dir/?api=1&destination=${c.lat},${c.lon}`;
+  return `<div class="stay-result"><h3>⚡ ${esc(c.name||'Charging station')}</h3>
+    <div class="t">${meta.join('<br>')}</div>
+    <a class="stay-dir" href="${dir}" target="_blank" rel="noopener">🧭 Directions in Google Maps ↗</a></div>`;
+}
+// Back to map → close the overlay, draw the radius ring and the alternatives as tier-coloured dots.
+$('altBack').addEventListener('click', () => {
+  $('altPage').classList.remove('show');
+  if (altCenter && altList.length) renderAltDots(altList, altCenter, altRadiusKm);
+});
+function renderAltDots(list, center, R){
+  clearAltDots();
+  // radius ring
+  map.addSource('alt-ring', { type:'geojson', data:{ type:'Feature',
+    geometry:{ type:'Polygon', coordinates:[circlePolygon(center.lat, center.lon, R)] } } });
+  map.addLayer({ id:'alt-ring-fill', type:'fill', source:'alt-ring',
+    paint:{ 'fill-color':'#0a7d4d', 'fill-opacity':0.06 } });
+  map.addLayer({ id:'alt-ring-line', type:'line', source:'alt-ring',
+    paint:{ 'line-color':'#0a7d4d', 'line-width':1.5, 'line-dasharray':[2,2], 'line-opacity':0.75 } });
+  // centre marker (the spot the driver is at)
+  map.addSource('alt-center', { type:'geojson', data:{ type:'Feature',
+    geometry:{ type:'Point', coordinates:[center.lon, center.lat] } } });
+  map.addLayer({ id:'alt-center', type:'circle', source:'alt-center',
+    paint:{ 'circle-radius':7, 'circle-color':'#b5471f', 'circle-stroke-width':3, 'circle-stroke-color':'#fff' } });
+  // alternatives, as miniature lightning badges coloured by power tier, clickable (add-to-route enabled)
+  for (const c of list){
+    const el = document.createElement('div');
+    el.className = 'altmark t' + tierOf(c.kw);
+    el.textContent = '⚡';
+    el.title = (c.name || 'Charging station') + (c.kw ? ` · ${c.kw} kW` : '');
+    el.addEventListener('click', ev => { ev.stopPropagation(); showPopup([c.lon, c.lat], chargerHtml(c, null, true)); });
+    altMarkers.push(new maplibregl.Marker({ element:el, anchor:'center' }).setLngLat([c.lon, c.lat]).addTo(map));
+  }
+  const ring = circlePolygon(center.lat, center.lon, R);
+  const lons = ring.map(p=>p[0]), lats = ring.map(p=>p[1]);
+  map.fitBounds([[Math.min(...lons),Math.min(...lats)],[Math.max(...lons),Math.max(...lats)]], { padding:60 });
+}
+function clearAltDots(){
+  altMarkers.forEach(m => m.remove()); altMarkers = [];
+  for (const id of ['alt-center','alt-ring-fill','alt-ring-line']) if (map.getLayer(id)) map.removeLayer(id);
+  for (const id of ['alt-center','alt-ring']) if (map.getSource(id)) map.removeSource(id);
+}
+
+function clearMap(){
+  clearHotels();
+  clearAltDots();
+  if (openPopup){ openPopup.remove(); openPopup = null; }
+  stopMarkers.forEach(m => m.remove()); stopMarkers = [];
+  endMarkers.forEach(m => m.remove()); endMarkers = [];
+  for (const id of ['route','corridor-fast','corridor-slow','corridor-ultra']) if (map.getLayer(id)) map.removeLayer(id);
+  for (const id of ['route','corridor']) if (map.getSource(id)) map.removeSource(id);
+}
+
+function esc(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c])); }
+function fmtDur(h){ if (h == null || !isFinite(h)) return '—';
+  const m = Math.round(h*60); return (m>=60 ? Math.floor(m/60)+'h ' : '') + (m%60) + 'm'; }
+
+function chargerHtml(c, stopNo, canAdd){
+  const bits = [];
+  if (c.operator) bits.push(`Operator: ${esc(c.operator)}`);
+  const spec = [];
+  if (c.kw) spec.push(`${esc(c.kw)} kW`);
+  if (c.points) spec.push(`${esc(c.points)} points`);
+  if (spec.length) bits.push(spec.join(' · '));
+  bits.push(`Charging: ${c.cost ? esc(c.cost) : 'cost not listed'}`);
+  if (c.usage) bits.push(esc(c.usage));
+  if (c.membership) bits.push('Membership / app may be required');
+  const apps = appsFor(`${c.operator||''} ${c.name||''}`);   // operator OR charger name
+  bits.push(apps.length
+    ? `Apps: ${esc(apps.join(', '))} — or roaming (${ROAMING_APPS})`
+    : `Apps: roaming (${ROAMING_APPS})`);
+  const near = c.place ? ` · near ${esc(c.place)}` : '';
+  const head = stopNo ? `Stop ${stopNo}${near}` : `⚡ ${esc(c.name||'Charging station')}`;
+  const sub = stopNo ? `<div class="t">⚡ ${esc(c.name||'Charging station')}</div>` : '';
+  const hasLoc = c.lat != null && c.lon != null;
+  const addBtn = (canAdd && hasLoc)
+    ? `<button class="popbtn add" onclick="addUserStop(${(+c.lat)},${(+c.lon)})">➕ Add this stop to my route</button>` : '';
+  const altBtn = hasLoc
+    ? `<button class="popbtn alt" onclick="showAlternatives(${(+c.lat)},${(+c.lon)})">⚡ This one down? Alternatives within 10 km</button>` : '';
+  const hotelBtn = hasLoc
+    ? `<button class="popbtn hotel" onclick="findAccommodation(${(+c.lat)},${(+c.lon)})">🏨 Accommodation within 3 km</button>` : '';
+  return `<h3>${head}</h3>${sub}<div class="t" style="margin-top:6px">${bits.join('<br>')}</div>
+    <div class="t" style="margin-top:6px">Data: Open Charge Map</div>${addBtn}${altBtn}${hotelBtn}`;
+}
+
+function renderTrip(info){
+  const { pts, routeGeo, result, car, realRoad, distKm, det, drivingH, chargeH,
+          ferryMin, ferryName, routeIdx, nDays, maxHours } = info;
+  clearMap();
+  const { stops, corridor, L, reachedEnd } = result;
+  let costTotal = 0;
+  stops.forEach(s => { const free = s.cost && /free/i.test(s.cost); costTotal += free ? 0 : (s.addKWh||0)*EUR_PER_KWH; });
+  const vig = countriesAlong(routeGeo).filter(c => VIGNETTE[c]);   // vignette countries on the route
+
+  // route line (real road geometry when routing succeeded; straight otherwise)
+  map.addSource('route', { type:'geojson', data:{ type:'Feature',
+    geometry:{ type:'LineString', coordinates: routeGeo.map(p => [p.lon, p.lat]) } } });
+  map.addLayer({ id:'route', type:'line', source:'route',
+    paint:{ 'line-color':'#1d6fe0', 'line-width':4, 'line-opacity':0.75 } });
+
+  // corridor chargers as small dots (click for detail)
+  map.addSource('corridor', { type:'geojson', data:{ type:'FeatureCollection',
+    features: corridor.map(c => ({ type:'Feature',
+      properties:{ name:c.name||'', operator:c.operator||'', kw:c.kw||'', points:c.points||'',
+                   cost:c.cost||'', usage:c.usage||'', membership:c.membership||0, lat:c.lat, lon:c.lon,
+                   tier: (function(k){ k=(k===''||k==null)?0:+k; return k>=ULTRA_KW?2:(k>=FAST_KW?1:0); })(c.kw) },
+      geometry:{ type:'Point', coordinates:[c.lon, c.lat] } })) } });
+  // Tier 0 — slow / AC (<75 kW): small, soft green.
+  map.addLayer({ id:'corridor-slow', type:'circle', source:'corridor',
+    filter:['==',['get','tier'],0],
+    paint:{ 'circle-radius':['interpolate',['linear'],['zoom'], 5,2, 10,3.5, 14,5],
+            'circle-color':'#7bbf9c', 'circle-opacity':0.6,
+            'circle-stroke-width':1, 'circle-stroke-color':'#fff' } });
+  // Tier 1 — fast DC (75–299 kW): larger, dark green.
+  map.addLayer({ id:'corridor-fast', type:'circle', source:'corridor',
+    filter:['==',['get','tier'],1],
+    paint:{ 'circle-radius':['interpolate',['linear'],['zoom'], 5,4, 10,7, 14,11],
+            'circle-color':'#0a5d2e', 'circle-opacity':0.92,
+            'circle-stroke-width':1.5, 'circle-stroke-color':'#fff' } });
+  // Tier 2 — ultra-rapid (300 kW+): largest, black — drawn on top.
+  map.addLayer({ id:'corridor-ultra', type:'circle', source:'corridor',
+    filter:['==',['get','tier'],2],
+    paint:{ 'circle-radius':['interpolate',['linear'],['zoom'], 5,5, 10,9, 14,14],
+            'circle-color':'#111111', 'circle-opacity':0.95,
+            'circle-stroke-width':1.5, 'circle-stroke-color':'#fff' } });
+  for (const lid of ['corridor-slow','corridor-fast','corridor-ultra']){
+    map.on('click', lid, e => showPopup(e.lngLat, chargerHtml(e.features[0].properties, null, true)));
+    map.on('mouseenter', lid, ()=> map.getCanvas().style.cursor='pointer');
+    map.on('mouseleave', lid, ()=> map.getCanvas().style.cursor='');
+  }
+
+  // numbered stop markers
+  stops.forEach((s, i) => {
+    const el = document.createElement('div');
+    el.className = 'stopmark' + (s.slow ? ' slow' : '') + (s.overnight ? ' overnight' : '');
+    el.textContent = String(i+1);
+    el.addEventListener('click', () => showPopup([s.lon,s.lat], chargerHtml(s, i+1, false)));
+    stopMarkers.push(new maplibregl.Marker({ element:el, anchor:'center' }).setLngLat([s.lon,s.lat]).addTo(map));
+  });
+  // A / B labels
+  [[pts[0],'A'],[pts[pts.length-1],'B']].forEach(([p,lab]) => {
+    const el = document.createElement('div'); el.className='endmark'; el.textContent = lab + ' · ' + p.name;
+    endMarkers.push(new maplibregl.Marker({ element:el, anchor:'center' }).setLngLat([p.lon,p.lat]).addTo(map));
+  });
+
+  // fit to the whole route geometry
+  const lons = routeGeo.map(p=>p.lon), lats = routeGeo.map(p=>p.lat);
+  map.fitBounds([[Math.min(...lons),Math.min(...lats)],[Math.max(...lons),Math.max(...lats)]],
+    { padding:60, maxZoom:11 });
+
+  // panel
+  const drivingKm = Math.round(distKm);
+  const startN = pts[0].name, endN = pts[pts.length-1].name;
+  let html = `<div class="card"><h2>${esc(startN)} → ${esc(endN)}</h2>`;
+
+  // route options selector (ferry vs land, etc.) when OSRM returned alternatives
+  if (TRIP && TRIP.routes.length > 1){
+    html += `<div class="routes">`;
+    TRIP.routes.forEach((rt, i) => {
+      const ferry = rt.ferryMin > 0 ? ` · ⛴ ${Math.round(rt.ferryMin)}m` : '';
+      const lab = `${Math.round(rt.distKm).toLocaleString()} km · ${fmtDur(rt.durationH)}${ferry}`;
+      const name = rt.ferryMin > 0 ? '⛴ Via ferry' : (i === 0 ? 'Fastest' : `Alternative ${i}`);
+      html += `<button class="rbtn${i===routeIdx?' on':''}" onclick="planOnRoute(${i})">
+        <span class="rlab">${name}</span> — ${lab}</button>`;
+    });
+    html += `</div>`;
+  }
+
+  html += `<div class="row"><span>Car</span><b>${esc(car.model)}</b></div>
+    <div class="row"><span>Driving distance</span><b>~${drivingKm.toLocaleString()} km</b></div>
+    <div class="row"><span>Your range</span><b>${car.rangeKm} km</b></div>
+    <div class="row"><span>Charging stops</span><b>${stops.length}</b></div>
+    <div class="row"><span>Driving time</span><b>${fmtDur(drivingH)}</b></div>`;
+  if (ferryMin > 0)
+    html += `<div class="row"><span>Incl. ferry</span><b>~${Math.round(ferryMin)} min${ferryName?' · '+esc(ferryName):''}</b></div>`;
+  html += `<div class="row"><span>Charging time</span><b>${fmtDur(chargeH)}</b></div>
+    <div class="row" style="border-top:1px solid var(--rule);margin-top:4px;padding-top:6px">
+      <span><b>Total trip time</b></span><b style="color:var(--accent)">${fmtDur((drivingH||0)+(chargeH||0))}</b></div>`;
+  if (nDays > 1)
+    html += `<div class="row"><span>Days (driving)</span><b>${nDays} · ~${maxHours}h/day max</b></div>`;
+  html += `<div class="row"><span>Est. charging cost</span><b>~€${Math.round(costTotal)} <span style="color:var(--muted);font-weight:normal">ballpark</span></b></div>`;
+
+  if (!stops.length && reachedEnd){
+    html += `<div class="ok">You can make this trip on a single charge — no stops needed
+      (within an ${Math.round(SAFETY*100)}% safety margin).</div>`;
+  } else if (reachedEnd){
+    html += `<div class="ok">Planned with an ${Math.round(SAFETY*100)}% range safety margin,
+      fast chargers preferred.</div>`;
+  } else {
+    html += `<div class="warn">⚠ There's a stretch with no reachable charger within your range.
+      Charge to full before it, slow down to extend range, or add a stop along the way to pull in
+      more chargers. The plan below covers the route up to that gap.</div>`;
+  }
+
+  // Vignette / road-toll warning for countries the route crosses (buy BEFORE you go).
+  if (vig.length){
+    html += `<div class="warn" style="background:#fff4e6;border-color:#e0b878;color:#7a4a12">
+      🛣️ <b>Vignette / road toll required</b> for
+      ${vig.map(c => `<a href="${VIGNETTE[c].url}" target="_blank" rel="noopener">${esc(VIGNETTE[c].name)}</a>`).join(', ')}.
+      Buy the <b>official</b> e-vignette <b>before you cross the border</b> — use the official links here, not third-party resellers.</div>`;
+  }
+
+  if (stops.length){
+    let curDay = 0, listOpen = false;
+    stops.forEach((s,i) => {
+      if (maxHours && s.dayNum && s.dayNum !== curDay){       // day header when splitting
+        if (listOpen) html += `</ol>`;
+        curDay = s.dayNum;
+        html += `<div class="dayhdr">Day ${curDay}</div><ol class="stops">`;
+        listOpen = true;
+      } else if (!listOpen){ html += `<ol class="stops">`; listOpen = true; }
+
+      const km = Math.round(s.pos * det);
+      const kw = s.kw ? `${s.kw} kW` : 'kW n/a';
+      const cost = s.cost ? esc(s.cost)
+                 : (s.addKWh ? `~€${Math.round(s.addKWh*EUR_PER_KWH)} est` : 'cost not listed');
+      const place = s.place ? esc(s.place) : esc(s.name || 'Charging station');
+      const chargerName = s.place ? `<br><span style="color:#6a6152">${esc(s.name||'Charging station')}</span>` : '';
+      const chg = s.chargeMin ? ` · ~${Math.round(s.chargeMin)} min charge` : '';
+      const apps = appsFor(`${s.operator||''} ${s.name||''}`);   // operator OR charger name
+      const who = s.operator ? esc(s.operator) : (apps.length ? esc(apps[0]) : 'Operator n/a');
+      const useApps = apps.length ? apps.concat(['Chargemap','Plugsurfing'])
+                                  : ['Chargemap','Plugsurfing','Shell Recharge'];
+      const opLine = `<br>${who}<br><span style="color:#6a6152">Charge with: ${esc(useApps.join(', '))}</span>`;
+      // overnight: suggest HotelScout for a bed near this town
+      const hsLink = `${HOTELSCOUT_URL}?lat=${(+s.lat).toFixed(5)}&lon=${(+s.lon).toFixed(5)}&near=${encodeURIComponent(s.place||'')}`;
+      const overnight = s.overnight
+        ? `<div class="overnight-tag">🌙 <b>Overnight near ${s.place?esc(s.place):'here'}</b> — charge while you sleep.
+             <br><a href="${hsLink}" target="_blank" rel="noopener">🏨 Find a place to stay with HotelScout →</a></div>`
+        : '';
+      html += `<li><span class="num${s.slow?' slow':''}${s.overnight?' overnight':''}">${i+1}</span>
+        <span><span class="stopname">${place}</span>${chargerName}<br>
+        <span class="stopmeta">~${km.toLocaleString()} km in · ${kw} · ${cost}${chg}${s.slow?' · <b style="color:#c77d0a">slow only</b>':''}
+        ${opLine}</span>${overnight}</span></li>`;
+    });
+    if (listOpen) html += `</ol>`;
+  }
+  const basis = realRoad
+    ? `Distance, driving time and any ferry follow the real road route (via ${esc((TRIP&&TRIP.engine)||'OSRM')}). `
+    : `Routing was unavailable, so distance is a straight-line estimate (×${DETOUR}) and time is rough. `;
+  html += `<div class="note">${basis}Charging time is estimated for <b>${esc(car.model)}</b>
+    (${car.batt} kWh, ${car.maxkw} kW max), assuming ~85% of peak power. Ferry times are rough —
+    check the operator's timetable. Verify each charger and your real range before you rely on it.</div></div>`;
+  $('summary').innerHTML = html;
+}
+
+$('back').addEventListener('click', () => { $('start').style.display = 'flex'; });
+</script>
+</body>
+</html>

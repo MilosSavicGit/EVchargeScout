@@ -1,37 +1,57 @@
 # .github/workflows/update-ev-data.yml
 #
-# Weekly EV charger refresh from Open Charge Map.
+# Weekly: refresh Open Charge Map, re-merge, commit.
+# OpenStreetMap is NOT part of the weekly run - tick the box on a manual run,
+# or do it locally.
 #
-# Runs on GitHub's machines, so it does not need your PC to be awake, and it
-# commits straight to main - GitHub Pages redeploys on its own.
+#     build_ev.py --out ocm    Open Charge Map  -> ocm/<cc>.json   (weekly)
+#     build_osm.py             OpenStreetMap    -> osm/<cc>.json   (manual only)
+#     build_merge.py           merge + dedup    -> ev/<cc>.json    (always)
 #
-# SETUP (once):
-#   1. Repo -> Settings -> Secrets and variables -> Actions -> New repository secret
-#      Name: OCM_API_KEY      Value: your Open Charge Map key
-#   2. Repo -> Settings -> Actions -> General -> Workflow permissions
-#      -> "Read and write permissions"  (needed to commit the refreshed data)
+# TWO THINGS THAT WILL BITE IF CHANGED
 #
-# Weekly runs are DELTAS (--since auto), which is what makes this polite: OCM
-# ask callers not to re-download the world, and reserve the right to ban for
-# excessive use. A delta asks only for what changed since each file was built.
+# 1. --out ocm is not optional. build_ev.py still defaults to writing ev/, which
+#    is now the MERGED output. Without the flag this job overwrites the merge
+#    with OCM-only data every Sunday, and nothing reports it: the files are
+#    still there and still valid JSON, just missing every OSM charger and pin.
 #
-# A delta can never see a DELETED charger - OCM just stops returning it. So the
-# first run of each month is a full rebuild instead, which does catch removals.
+# 2. The merge must run after ANY refresh, or ev/ drifts out of step with ocm/.
+#    It is cheap - about a minute for 56 countries - so it always runs.
+#
+# WHY OSM IS NOT ON THE SCHEDULE
+#
+# The first full OSM run took 76 minutes, four countries failed, and it needed a
+# manual retry; two of three Overpass mirrors returned errors for the whole
+# evening. That is fine to babysit and bad to leave unattended at 3am, where a
+# partial result looks exactly like a successful one.
+#
+# It is also the half that does not need to be fresh. OSM charger data grows but
+# does not rot - a station mapped in August is still there in November. OCM is
+# where decommissioned chargers get flagged, and that is the risk this app cares
+# about. So the half that must stay current is the half that is automated.
+#
+# Run it locally every few months:
+#     python build_osm.py --all --resume
+#     python build_merge.py --all
+# then commit osm/ and ev/.
 
 name: Update EV charger data
 
 on:
   schedule:
-    # 03:00 UTC Sunday. Quiet hours in the UK, where OCM is hosted.
+    # 03:00 UTC Sunday — quiet hours in the UK, where OCM is hosted.
     - cron: '0 3 * * 0'
   workflow_dispatch:
     inputs:
       full:
-        description: 'Full rebuild instead of a delta'
+        description: 'Full OCM rebuild instead of a delta'
+        type: boolean
+        default: false
+      refresh_osm:
+        description: 'Also refresh OpenStreetMap (slow, ~90 min, may partly fail)'
         type: boolean
         default: false
 
-# Never let two runs commit at once.
 concurrency:
   group: update-ev-data
   cancel-in-progress: false
@@ -39,20 +59,23 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # 45 min covers OCM + merge comfortably; the OSM box raises it in practice
+    # because that step simply takes longer, so the ceiling is set for the worst case.
+    timeout-minutes: 300
 
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Decide delta or full rebuild
+      - name: Delta or full rebuild?
         id: mode
         run: |
-          # Manual runs honour the checkbox. Scheduled runs go full on the
-          # first Sunday of the month so removals get picked up.
+          # Manual runs honour the checkbox. Scheduled runs go full on the first
+          # Sunday of the month, because a delta can never see a DELETED charger -
+          # OCM just stops returning it - and a charger that no longer exists is
+          # the one error a driver plans around.
           if [ "${{ github.event.inputs.full }}" = "true" ]; then
             echo "args=" >> "$GITHUB_OUTPUT"
             echo "why=full (requested)" >> "$GITHUB_OUTPUT"
@@ -64,45 +87,110 @@ jobs:
             echo "why=delta" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build
+      - name: Open Charge Map
         env:
           OCM_API_KEY: ${{ secrets.OCM_API_KEY }}
         run: |
-          echo "Mode: ${{ steps.mode.outputs.why }}"
-          python build_ev.py --all ${{ steps.mode.outputs.args }}
+          echo "mode: ${{ steps.mode.outputs.why }}"
+          python build_ev.py --all --out ocm --no-bump ${{ steps.mode.outputs.args }}
+
+      # ---- OpenStreetMap: manual runs only, when the box is ticked ----
+      - name: OpenStreetMap (manual)
+        if: github.event.inputs.refresh_osm == 'true'
+        run: python build_osm.py --all --resume
+
+      - name: Retry OSM countries that failed (manual)
+        if: github.event.inputs.refresh_osm == 'true'
+        continue-on-error: true
+        run: |
+          if [ -f osm/_failed.txt ]; then
+            echo "retrying: $(tr '\n' ' ' < osm/_failed.txt)"
+            sleep 120
+            python build_osm.py --only-failed osm/_failed.txt
+          fi
+
+      # ---- always ----
+      - name: Check neither source has holes
+        run: python check_sources.py
+
+      - name: Merge
+        run: python build_merge.py --all
+
+      - name: Bump EV_DATA_VERSION
+        run: |
+          # The app force-caches charger files. Without a new ?v= value, a
+          # returning user keeps whatever their browser downloaded first - for
+          # ever, silently.
+          python - <<'PY'
+          import re, io, time
+          p = 'index.html'
+          s = io.open(p, encoding='utf-8').read()
+          new = time.strftime('%Y-%m-%d')
+          s2 = re.sub(r'const EV_DATA_VERSION = "[^"]+";',
+                      f'const EV_DATA_VERSION = "{new}";', s, count=1)
+          assert s2 != s, "EV_DATA_VERSION line not found - refusing to ship a stale cache key"
+          io.open(p, 'w', encoding='utf-8').write(s2)
+          print("EV_DATA_VERSION ->", new)
+          PY
 
       - name: Sanity check before committing
         run: |
-          # A partial or empty result is worse than stale data, because it
-          # would ship and look fine. Refuse to commit an obviously broken run.
+          # Per COUNTRY, not one global total. The old check summed every country
+          # and failed under 100,000 - but the US, GB and Germany alone are about
+          # 139,000, so any single country could fall to zero and still pass.
           python - <<'PY'
-          import json, glob, os, sys
-          files = [f for f in glob.glob('ev/*.json') if not f.endswith('ev.json')]
-          if len(files) < 40:
-              sys.exit(f"only {len(files)} country files - expected ~47")
-          total = 0
-          empty = []
+          import json, glob, os, subprocess, sys
+          DROP = 0.80
+          files = sorted(f for f in glob.glob('ev/*.json') if not f.endswith('ev.json'))
+          if len(files) < 50:
+              sys.exit(f"only {len(files)} merged files - expected ~56")
+
+          def committed(path):
+              try:
+                  raw = subprocess.run(['git', 'show', f'HEAD:{path}'],
+                                       capture_output=True, check=True).stdout
+                  return json.loads(raw.decode('utf-8'))
+              except Exception:
+                  return None
+
+          total = pins = 0
+          drops, empty = [], []
           for f in files:
               d = json.load(open(f, encoding='utf-8'))
               n = d.get('count', 0)
               total += n
-              if n == 0:
-                  empty.append(os.path.basename(f))
-          print(f"{len(files)} files, {total:,} chargers")
+              pins += d.get('pin_count', 0)
+              cc = os.path.basename(f)[:-5]
+              if n == 0 and d.get('pin_count', 0) == 0:
+                  empty.append(cc)
+              old = committed(f)
+              if old:
+                  had = old.get('count', 0)
+                  if had and n < had * DROP:
+                      drops.append(f"{cc}: {n:,} vs {had:,} committed ({100.0*n/had:.0f}%)")
+
+          print(f"{len(files)} countries · {total:,} plannable · {pins:,} pins")
           if empty:
-              print("empty:", ", ".join(empty))
-          if total < 100000:
-              sys.exit(f"only {total:,} chargers total - refusing to commit")
+              sys.exit("empty countries: " + ", ".join(empty))
+          if total < 200000:
+              sys.exit(f"only {total:,} plannable - refusing to commit")
+          if drops:
+              print("per-country regressions:")
+              for d in drops:
+                  print("   " + d)
+              sys.exit("a country shrank by more than 20% - refusing to commit")
           PY
 
       - name: Commit if anything changed
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add ev/ index.html
+          # osm/ is staged too: it is unchanged on a weekly run, but a manual run
+          # with the box ticked must not leave it behind.
+          git add ocm/ osm/ ev/ index.html
           if git diff --staged --quiet; then
             echo "No changes - nothing to commit."
             exit 0
           fi
-          git commit -m "EV data refresh (${{ steps.mode.outputs.why }}) — data © Open Charge Map contributors"
+          git commit -m "Charger data refresh (${{ steps.mode.outputs.why }}) — Open Charge Map (CC BY 4.0) + OpenStreetMap contributors (ODbL)"
           git push

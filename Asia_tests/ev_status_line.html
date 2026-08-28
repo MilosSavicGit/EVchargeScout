@@ -1,0 +1,88 @@
+<!-- ============================================================
+     EVchargeScout status line
+     Paste the markup where you want it (see notes below), and the
+     <script> anywhere after BUILD_VERSION / EV_DATA_VERSION are declared.
+
+     Reads ev/ev.json — the manifest build_ev.py writes — so the count
+     and the date are whatever was actually built. Nothing to update by
+     hand except BUILD_VERSION itself.
+     ============================================================ -->
+
+<p id="evStatus" class="ev-status" data-nosnippet>
+  <span id="evBuild"></span>
+</p>
+
+<style>
+  .ev-status{
+    font-size:.78rem;
+    line-height:1.4;
+    opacity:.65;
+    margin:.4rem 0 0;
+  }
+  .ev-status .sep{ opacity:.5; margin:0 .35em; }
+  .ev-status .lag{ opacity:1; font-weight:600; }
+</style>
+
+<script>
+(function () {
+  var el    = document.getElementById('evStatus');
+  var build = document.getElementById('evBuild');
+  if (!el || !build) return;
+
+  // Build version always shows, even if the data fetch fails.
+  build.textContent = 'Build ' + (typeof BUILD_VERSION === 'string' ? BUILD_VERSION : '?');
+
+  function fmtDate(iso) {
+    var d = new Date(iso + 'T00:00:00');
+    if (isNaN(d)) return iso;
+    return d.toLocaleDateString(undefined, { day:'numeric', month:'short', year:'numeric' });
+  }
+
+  function sep()  { var s = document.createElement('span'); s.className='sep'; s.textContent='·'; return s; }
+  function span(t, cls) { var s = document.createElement('span'); if (cls) s.className=cls; s.textContent=t; return s; }
+
+  var v = (typeof EV_DATA_VERSION === 'string') ? EV_DATA_VERSION : '';
+
+  fetch('ev/ev.json' + (v ? '?v=' + encodeURIComponent(v) : ''), { cache: 'force-cache' })
+    .then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);   // real answer: manifest missing
+      return r.json();
+    })
+    .then(function (rows) {
+      if (!Array.isArray(rows) || !rows.length) throw new Error('empty manifest');
+
+      var total = 0, dates = [];
+      rows.forEach(function (r) {
+        total += (r.count || 0);
+        if (r.generated) dates.push(r.generated);
+      });
+      if (!dates.length) throw new Error('no dates');
+
+      dates.sort();                       // ISO dates sort lexically
+      var newest = dates[dates.length - 1];
+      var oldest = dates[0];
+
+      // A country whose rebuild failed keeps its old file and its old date.
+      // Count anything more than 14 days behind the newest build as lagging.
+      var cutoff = new Date(newest + 'T00:00:00');
+      cutoff.setDate(cutoff.getDate() - 14);
+      var lagging = dates.filter(function (d) { return new Date(d + 'T00:00:00') < cutoff; }).length;
+
+      el.appendChild(sep());
+      el.appendChild(span(total.toLocaleString() + ' chargers'));
+      el.appendChild(sep());
+      el.appendChild(span(rows.length + ' countries'));
+      el.appendChild(sep());
+      el.appendChild(span('updated ' + fmtDate(newest)));
+
+      if (lagging) {
+        el.appendChild(sep());
+        el.appendChild(span(lagging + ' behind (oldest ' + fmtDate(oldest) + ')', 'lag'));
+      }
+    })
+    .catch(function () {
+      el.appendChild(sep());
+      el.appendChild(span('charger data not loaded'));
+    });
+})();
+</script>

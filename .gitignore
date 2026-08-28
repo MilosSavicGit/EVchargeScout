@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+osm/_failed.txt
+index_prepatch.html
+*.tmp
+SCR1.png
+Documentation/
+CLEANUP.md
+READMEOSM.md
+REBUILDPOLAND.md

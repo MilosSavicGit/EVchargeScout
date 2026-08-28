@@ -68,13 +68,11 @@
   ]
 }
 </script>
-<meta property="og:title" content="EVchargeScout — EV road-trip charging planner" />
-<meta property="og:description" content="Tell it where you're driving and how far your car goes — it plans the charging stops. Ferries, superchargers, multi-day overnight splits. Keyless, open data." />
-<meta property="og:type" content="website" />
 
 <!-- Same static, no-build recipe as the other Scouts. Charger data is prepared per
-     country into ev/<cc>.json by build_ev.py (Open Charge Map). The only runtime call
-     is a light Nominatim geocode of the places you type — everything else is local. -->
+     country into ev/<cc>.json by build_ev.py (Open Charge Map) + build_osm.py
+     (OpenStreetMap), merged by build_merge.py. The only runtime call is a light
+     Nominatim geocode of the places you type — everything else is local. -->
 <link href="https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
 <script src="https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
 
@@ -280,8 +278,9 @@
     <p class="busy" id="busy"></p>
 
     <p class="foot">
-      Chargers from <a href="https://openchargemap.org" target="_blank" rel="noopener">Open Charge Map</a>;
-      places resolved via <a href="https://www.openstreetmap.org" target="_blank" rel="noopener">OpenStreetMap</a>.
+      Charger data from <a href="https://openchargemap.org" target="_blank" rel="noopener">Open Charge Map</a>
+      (CC BY 4.0) and <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap
+      contributors</a> (ODbL); places resolved via OpenStreetMap.
       Best coverage across Europe, North America and Australia. Distances are a
       <b>planning estimate</b> along your route, not exact road distance —
       always keep a buffer and check chargers before you rely on them.
@@ -323,7 +322,9 @@
 /* ===================================================================
    EVchargeScout — static EV road-trip charging planner.
    Reuses the ScoutPlatform recipe: MapLibre + OSM tiles, no API keys,
-   prepared ev/<cc>.json charger files from build_ev.py (Open Charge Map).
+   prepared ev/<cc>.json charger files. Those files are now MERGED from
+   two sources by build_merge.py: Open Charge Map (curated, nearly always
+   has power) and OpenStreetMap (wider coverage, often no power at all).
    =================================================================== */
 
 const $ = id => document.getElementById(id);
@@ -334,12 +335,12 @@ const $ = id => document.getElementById(id);
    first downloaded - forever, silently. On a beach app that is stale data; here
    it is routing somebody to a charger that was decommissioned months ago.
    EV_DATA_VERSION_LINE - do not rename this marker. */
-const EV_DATA_VERSION = "2026-08-25";
+const EV_DATA_VERSION = "2026-08-28";
 
 /* Shown in the corner of the start screen and logged to the console. Bump on
    every release, so a running app can always be identified from a screenshot. */
-const BUILD_VERSION = "1.0.3 (2026-08-25)";
-console.log("%cEVchargeScout build: " + BUILD_VERSION + " \u00b7 charger data " + EV_DATA_VERSION,
+const BUILD_VERSION = "1.1.0 (2026-08-28)";
+console.log("%cEVchargeScout build: " + BUILD_VERSION + " · charger data " + EV_DATA_VERSION,
             "font-weight:bold");
 
 /* ------------------------------------------------------------------
@@ -563,6 +564,26 @@ const VIGNETTE = {
   ro:{ name:'Romania',     url:'https://www.erovinieta.ro/' },
   bg:{ name:'Bulgaria',    url:'https://bgtoll.bg/en/' }
 };
+/* ------------------------------------------------------------------
+   WHERE A FOREIGN CARD DOES NOT WORK
+
+   Visa and Mastercard stopped processing foreign-issued cards in Russia
+   and Belarus in 2022 and still do not. Nor do Chargemap, Plugsurfing or
+   any other international roaming app have agreements there.
+
+   The chargers are real and locals use them daily, so hiding them would
+   be its own kind of lie. But routing a driver from Berlin through Minsk
+   to a charger they physically cannot pay for is exactly the failure this
+   app exists to prevent - worse than a missing charger, because they only
+   discover it at 8% battery.
+
+   So: show them, plan with them, and say plainly what payment needs.
+   ------------------------------------------------------------------ */
+const NO_FOREIGN_CARDS = {
+  ru: { name:'Russia',  local:'a Mir card, cash, or the operator\u2019s own Russian app' },
+  by: { name:'Belarus', local:'a local card, cash, or the operator\u2019s own app' }
+};
+
 function appsFor(operator){
   if (!operator) return [];
   const s = operator.toLowerCase(), out = [];
@@ -657,7 +678,7 @@ map.addControl(new maplibregl.NavigationControl(), 'top-right');
 // Tap an empty part of the map → offer to show all chargers within 10 km of that point.
 // (Taps that land on a charger/stay/alt dot are left to those layers' own handlers.)
 map.on('click', (e) => {
-  const layers = ['corridor-slow','corridor-fast','corridor-ultra','stay-dots'].filter(l => map.getLayer(l));
+  const layers = ['corridor-slow','corridor-fast','corridor-ultra','stay-dots','pins'].filter(l => map.getLayer(l));
   if (layers.length && map.queryRenderedFeatures(e.point, { layers }).length) return;   // hit a dot
   if (!TRIP || !(TRIP.chargers && TRIP.chargers.length)) return;                          // no data loaded yet
   const { lat, lng } = e.lngLat;
@@ -705,10 +726,22 @@ function planStops(routeXY, segCum, L, chargers, rangeKm, det, forced){
   // Tag every corridor charger so the map can show an incompatible one as
   // present-but-unusable, rather than pretending it is not there at all.
   corridor.forEach(c => { c._cs = connState(c); });
-  // Plan only on what fits. 'unknown' stays in the pool - OCM leaves ~16% of
-  // German connections unrecorded, and dropping those would gut Europe.
-  const fits = corridor.filter(c => c._cs !== 'incompatible');
-  const fast = fits.filter(c => c.kw !== '' && c.kw != null && +c.kw >= FAST_KW);
+
+  /* Connector 'unknown' stays in the pool - OCM leaves ~16% of German
+     connections unrecorded, and dropping those would gut Europe.
+
+     POWER is a different matter, and this gate is new. Without a kW figure
+     there is no charging time to compute, and picking such a charger as a
+     fallback stop labelled "slow only" states something we do not know: it
+     could be a 350 kW Ionity or a 3 kW socket. Since the OSM merge, many
+     records arrive with no power at all (Poland: 84% of the OSM side), so
+     without this gate the planner would quietly start routing through them.
+
+     `corridor` is deliberately NOT filtered - everything still draws on the
+     map. This only governs what may become a planned stop. */
+  const hasKw = c => c.kw !== '' && c.kw != null && +c.kw > 0;
+  const fits = corridor.filter(c => c._cs !== 'incompatible' && hasKw(c));
+  const fast = fits.filter(c => +c.kw >= FAST_KW);
 
   // User-forced charging stops (clicked on the map) — projected onto THIS route, in order.
   const forcedStops = (forced || []).map(f => {
@@ -745,6 +778,13 @@ function planStops(routeXY, segCum, L, chargers, rangeKm, det, forced){
 /* ---------------- data loading ---------------- */
 const countryCache = {};
 
+/* Display-only chargers from the merged files: location known, power and
+   connector not. Kept in a SEPARATE store from countryCache deliberately - if
+   they shared one, a later change could quietly let them into the planner.
+   Shape is a compact array, documented as "pin_fields" in each country file. */
+const pinCache = {};
+const PIN = a => ({ id:a[0], lat:a[1], lon:a[2], name:a[3], operator:a[4], src:a[5] });
+
 /* Countries whose file we could not FETCH this session - as opposed to
    countries we fetched and found nothing for. Cleared per attempt.
 
@@ -777,10 +817,12 @@ async function loadCountry(cc){
       // A real answer: there is no file for this country. It will not appear
       // later in the session, so caching the empty list is correct.
       countryCache[cc] = [];
+      pinCache[cc] = [];
       return [];
     }
     const j = await r.json();
     countryCache[cc] = j.chargers || [];
+    pinCache[cc] = (j.pins || []).map(PIN);
     return countryCache[cc];
   } catch(e){
     // Never reached the server, so nothing was learned about this country.
@@ -958,8 +1000,12 @@ async function reverseGeocode(lat, lon){
     const j = await r.json();
     const a = j.address || {};
     const name = a.city || a.town || a.village || a.municipality || a.suburb || a.county || a.state || '';
-    revCache[key] = name; return name;
-  } catch(e){ revCache[key] = ''; return ''; }
+    // The country matters as much as the town: it decides whether a foreign
+    // card will work at this stop. Bounding boxes cannot answer that - Russia's
+    // box swallows the Baltics - so we take it from the geocode we already do.
+    const cc = (a.country_code || '').toLowerCase();
+    revCache[key] = { name, cc }; return revCache[key];
+  } catch(e){ revCache[key] = { name:'', cc:'' }; return revCache[key]; }
 }
 
 /* ---------------- waypoint inputs ---------------- */
@@ -1166,7 +1212,7 @@ loadCars();
 /* ---------------- main: plan a trip ---------------- */
 $('planBtn').addEventListener('click', planTrip);
 
-let TRIP = null;   // current trip: { pts, routes, chargers, car, realRoad }
+let TRIP = null;   // current trip: { pts, routes, chargers, pins, car, realRoad }
 
 async function planTrip(){
   const startQ = $('fStart').value.trim();
@@ -1227,6 +1273,9 @@ async function computeAndRender(){
   countryLoadFailed.clear();                       // fresh attempt
   const lists = await Promise.all([...ccSet].map(loadCountry));
   const chargers = [].concat(...lists);
+  // Display-only pins were filled in by the same fetch. Kept apart from
+  // `chargers` all the way through, so they can never enter the planner.
+  const pins = [].concat(...[...ccSet].map(cc => pinCache[cc] || []));
 
   // A country we could not reach is a hole in the route, not a country without
   // chargers. Planning around it would produce a confident plan with a gap in
@@ -1244,7 +1293,8 @@ async function computeAndRender(){
     setBusy('No charger data for this route yet (Europe, North America & Australia are covered).');
     return;
   }
-  TRIP.pts = pts; TRIP.routes = routes; TRIP.chargers = chargers; TRIP.realRoad = realRoad; TRIP.engine = engine;
+  TRIP.pts = pts; TRIP.routes = routes; TRIP.chargers = chargers; TRIP.pins = pins;
+  TRIP.realRoad = realRoad; TRIP.engine = engine;
   await planOnRoute(0);
 }
 
@@ -1288,9 +1338,19 @@ async function planOnRoute(idx){
   const forced = (TRIP.vias || []).filter(v => v.forced);   // charger stops the user clicked in
   const result = planStops(routeXY, segCum, L, chargers, car.rangeKm, det, forced);
 
+  // Display-only pins within the same corridor. Computed here rather than in
+  // planStops, so there is no code path by which they could become a stop.
+  const pinsNear = [];
+  for (const p of (TRIP.pins || [])){
+    const pr = projectToRoute(toXY(p.lat, p.lon), routeXY, segCum);
+    if (pr.dist <= CORRIDOR) pinsNear.push(p);
+  }
+
   setBusy('Naming your stops…');
   await Promise.all(result.stops.map(async s => {
-    s.place = s.town || await reverseGeocode(s.lat, s.lon);
+    const g = await reverseGeocode(s.lat, s.lon);   // cached per 3dp, a handful of calls
+    s.place = s.town || g.name;
+    s.cc = g.cc;
   }));
 
   // Charging time per stop = energy for the next leg ÷ effective power (min of charger &
@@ -1313,7 +1373,7 @@ async function planOnRoute(idx){
   setBusy('');
   renderTrip({ pts, routeGeo: rt.coords, result, car, realRoad, det,
                distKm, drivingH, chargeH, ferryMin: rt.ferryMin, ferryName: rt.ferryName, routeIdx: idx,
-               nDays, maxHours: TRIP.maxHours || 0 });
+               nDays, maxHours: TRIP.maxHours || 0, pinsNear });
 }
 function setBusy(t){ $('busy').textContent = t; }
 
@@ -1349,12 +1409,14 @@ async function addUserStop(lat, lon){
 /* ---------------- accommodation (Stay Nearby) ----------------
    Borrowed from BeachScout: a full-screen overlay page with a Back button and a scrollable
    list. Overpass is the data source, but hit through several mirrors with a fallback so a
-   single overloaded server no longer means "it doesn't work". On Back, the found places are
-   drawn on the map as dark-purple dots. */
+   single overloaded server no longer means "it doesn't work".
+
+   MIRROR LIST: only general-purpose, planet-wide instances belong here. A regional
+   instance answers HTTP 200 with zero elements for anything outside its extract, which
+   is indistinguishable from "nothing found" — verify any addition before trusting it. */
 const OVERPASS_MIRRORS = [
   'https://overpass-api.de/api/interpreter',
   'https://overpass.kumi.systems/api/interpreter',
-  'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
   'https://overpass.private.coffee/api/interpreter'
 ];
 // POST with x-www-form-urlencoded is a "simple" request (no CORS preflight) and dodges URL limits.
@@ -1569,8 +1631,8 @@ function clearMap(){
   if (openPopup){ openPopup.remove(); openPopup = null; }
   stopMarkers.forEach(m => m.remove()); stopMarkers = [];
   endMarkers.forEach(m => m.remove()); endMarkers = [];
-  for (const id of ['route','corridor-fast','corridor-slow','corridor-ultra']) if (map.getLayer(id)) map.removeLayer(id);
-  for (const id of ['route','corridor']) if (map.getSource(id)) map.removeSource(id);
+  for (const id of ['route','corridor-fast','corridor-slow','corridor-ultra','pins']) if (map.getLayer(id)) map.removeLayer(id);
+  for (const id of ['route','corridor','pins']) if (map.getSource(id)) map.removeSource(id);
 }
 
 function esc(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c])); }
@@ -1608,15 +1670,18 @@ function chargerHtml(c, stopNo, canAdd){
     ? `<button class="popbtn alt" onclick="showAlternatives(${(+c.lat)},${(+c.lon)})">⚡ This one down? Alternatives within ${fmtDist(defaultRadiusKm(), 0)}</button>` : '';
   const hotelBtn = hasLoc
     ? `<button class="popbtn hotel" onclick="findAccommodation(${(+c.lat)},${(+c.lon)})">🏨 Accommodation within ${fmtDist(3, 0)}</button>` : '';
+  const srcLine = (c.src === 'osm') ? 'OpenStreetMap contributors'
+                : (c.src === 'both') ? 'Open Charge Map + OpenStreetMap — listed by both'
+                : 'Open Charge Map';
   return `<h3>${head}</h3>${sub}<div class="t" style="margin-top:6px">${bits.join('<br>')}</div>
-    <div class="t" style="margin-top:6px">Data: Open Charge Map</div>${addBtn}${altBtn}${hotelBtn}`;
+    <div class="t" style="margin-top:6px">Data: ${srcLine}</div>${addBtn}${altBtn}${hotelBtn}`;
 }
 
 let lastTripInfo = null;
 function renderTrip(info){
   lastTripInfo = info;          // so a units switch can rebuild the panel
   const { pts, routeGeo, result, car, realRoad, distKm, det, drivingH, chargeH,
-          ferryMin, ferryName, routeIdx, nDays, maxHours } = info;
+          ferryMin, ferryName, routeIdx, nDays, maxHours, pinsNear } = info;
   clearMap();
   const { stops, corridor, L, reachedEnd } = result;
   let costTotal = 0;
@@ -1632,11 +1697,44 @@ function renderTrip(info){
   map.addLayer({ id:'route', type:'line', source:'route',
     paint:{ 'line-color':'#1d6fe0', 'line-width':4, 'line-opacity':0.75 } });
 
+  /* Display-only pins: hollow grey rings, deliberately unlike the solid green
+     charger dots. A driver must be able to tell at a glance that one of these
+     is "something is here" rather than "you can plan a stop here". Added
+     FIRST so they always sit UNDER anything plannable. */
+  if (pinsNear && pinsNear.length){
+    map.addSource('pins', { type:'geojson', data:{ type:'FeatureCollection',
+      features: pinsNear.map(p => ({ type:'Feature',
+        properties:{ name:p.name||'', operator:p.operator||'' },
+        geometry:{ type:'Point', coordinates:[p.lon, p.lat] } })) } });
+    map.addLayer({ id:'pins', type:'circle', source:'pins',
+      paint:{ 'circle-radius':['interpolate',['linear'],['zoom'], 6,2.5, 10,4.5, 14,6.5],
+              // A faint white disc, not a transparent hole. The basemap runs from
+              // pale farmland to dark forest, and a truly hollow ring vanished over
+              // the dark greens exactly where these matter most - rural stretches.
+              'circle-color':'#ffffff', 'circle-opacity':0.55,
+              // Ring thickness scales with zoom so it stays a ring rather than
+              // closing into a blob when zoomed in.
+              'circle-stroke-width':['interpolate',['linear'],['zoom'], 6,1.6, 10,2.6, 14,3.2],
+              'circle-stroke-color':'#5f5a4e', 'circle-stroke-opacity':1 } });
+    map.on('click', 'pins', e => {
+      const p = e.features[0].properties;
+      showPopup(e.lngLat,
+        `<h3>⚡ ${esc(p.name || 'Charging station')}</h3>` +
+        (p.operator ? `<div class="t" style="margin-top:6px">Operator: ${esc(p.operator)}</div>` : '') +
+        `<div class="t" style="margin-top:6px;color:#c77d0a">Power and connector are not recorded for this
+           one, so it is shown but not used for planning. Check it before you rely on it.</div>` +
+        `<div class="t" style="margin-top:6px">Data: OpenStreetMap contributors</div>`);
+    });
+    map.on('mouseenter', 'pins', ()=> map.getCanvas().style.cursor='pointer');
+    map.on('mouseleave', 'pins', ()=> map.getCanvas().style.cursor='');
+  }
+
   // corridor chargers as small dots (click for detail)
   map.addSource('corridor', { type:'geojson', data:{ type:'FeatureCollection',
     features: corridor.map(c => ({ type:'Feature',
       properties:{ name:c.name||'', operator:c.operator||'', kw:c.kw||'', points:c.points||'',
                    cost:c.cost||'', usage:c.usage||'', membership:c.membership||0, lat:c.lat, lon:c.lon,
+                   src:c.src||'ocm',
                    tier: (function(k){ k=(k===''||k==null)?0:+k; return k>=ULTRA_KW?2:(k>=FAST_KW?1:0); })(c.kw) },
       geometry:{ type:'Point', coordinates:[c.lon, c.lat] } })) } });
   // Tier 0 — slow / AC (<75 kW): small, soft green.
@@ -1730,6 +1828,14 @@ function renderTrip(info){
       so they were skipped. If that is wrong, change <b>Charging socket on your car</b> and plan again.</div>`;
   }
 
+  // Grey rings on the map are real chargers we cannot plan with. Saying so once
+  // in the panel stops them reading as clutter or as a bug.
+  if (pinsNear && pinsNear.length){
+    html += `<div class="note">○ <b>${pinsNear.length}</b> more charger${pinsNear.length>1?'s are':' is'}
+      mapped along this route with no power or connector recorded, shown as grey rings.
+      They are real places, but there is not enough detail to plan a stop around them.</div>`;
+  }
+
   if (!stops.length && reachedEnd){
     html += `<div class="ok">You can make this trip on a single charge — no stops needed
       (within an ${Math.round(SAFETY*100)}% safety margin).</div>`;
@@ -1740,6 +1846,21 @@ function renderTrip(info){
     html += `<div class="warn">⚠ There's a stretch with no reachable charger within your range.
       Charge to full before it, slow down to extend range, or add a stop along the way to pull in
       more chargers. The plan below covers the route up to that gap.</div>`;
+  }
+
+  // Payment warning. Derived from the STOPS' own country codes, not from the
+  // bounding boxes - ru's box covers half of eastern Europe, so a Riga trip
+  // would have been warned about Russia.
+  const cardCcs = [...new Set(stops.map(s => s.cc).filter(cc => NO_FOREIGN_CARDS[cc]))];
+  if (cardCcs.length){
+    const names = cardCcs.map(cc => NO_FOREIGN_CARDS[cc].name).join(' and ');
+    const local = NO_FOREIGN_CARDS[cardCcs[0]].local;
+    html += `<div class="warn" style="background:#fdecea;border-color:#e0a89d;color:#8a2e1c">
+      \uD83D\uDCB3 <b>A foreign card will not work in ${esc(names)}.</b>
+      Visa and Mastercard have not processed cards issued abroad there since 2022, and
+      Chargemap, Plugsurfing and the other roaming apps have no agreements either.
+      Stops in ${esc(names)} need ${esc(local)} \u2014 arrange it before you cross, and
+      do not count on paying at the charger with the card in your pocket.</div>`;
   }
 
   // Vignette / road-toll warning for countries the route crosses (buy BEFORE you go).
@@ -1768,9 +1889,15 @@ function renderTrip(info){
       const chg = s.chargeMin ? ` · ~${Math.round(s.chargeMin)} min charge` : '';
       const apps = appsFor(`${s.operator||''} ${s.name||''}`);   // operator OR charger name
       const who = s.operator ? esc(s.operator) : (apps.length ? esc(apps[0]) : 'Operator n/a');
+      // In Russia and Belarus the roaming apps simply do not operate, so naming
+      // them here would be worse than saying nothing.
+      const noCard = NO_FOREIGN_CARDS[s.cc];
       const useApps = apps.length ? apps.concat(['Chargemap','Plugsurfing'])
                                   : ['Chargemap','Plugsurfing','Shell Recharge'];
-      const opLine = `<br>${who}<br><span style="color:#6a6152">Charge with: ${esc(useApps.join(', '))}</span>`;
+      const opLine = noCard
+        ? `<br>${who}<br><span style="color:#8a2e1c">\uD83D\uDCB3 Foreign cards do not work in
+             ${esc(noCard.name)} \u2014 needs ${esc(noCard.local)}</span>`
+        : `<br>${who}<br><span style="color:#6a6152">Charge with: ${esc(useApps.join(', '))}</span>`;
       // overnight: suggest HotelScout for a bed near this town
       const hsLink = `${HOTELSCOUT_URL}?lat=${(+s.lat).toFixed(5)}&lon=${(+s.lon).toFixed(5)}&near=${encodeURIComponent(s.place||'')}`;
       const overnight = s.overnight
@@ -1794,13 +1921,6 @@ function renderTrip(info){
 }
 
 $('back').addEventListener('click', () => { $('start').style.display = 'flex'; });
-
-/* Report the running build on screen, so a screenshot or a bug report always
-   identifies the version without asking. */
-window.addEventListener('load', () => {
-  const vt = $('versionTag');
-  if (vt) vt.textContent = "build " + BUILD_VERSION + " \u00b7 charger data " + EV_DATA_VERSION;
-});
 
 /* ---------------- units toggle ----------------
    Flipping the toggle converts whatever is already in the range box rather
@@ -1848,7 +1968,7 @@ document.querySelectorAll('#unitToggle button').forEach(b =>
    identifies the version without asking. */
 window.addEventListener('load', () => {
   const vt = $('versionTag');
-  if (vt) vt.textContent = "build " + BUILD_VERSION + " \u00b7 charger data " + EV_DATA_VERSION;
+  if (vt) vt.textContent = "build " + BUILD_VERSION + " · charger data " + EV_DATA_VERSION;
 });
 </script>
 </body>
